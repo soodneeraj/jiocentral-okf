@@ -1,0 +1,94 @@
+milvus_uri: http://localhost:19530
+milvus_user: ""
+milvus_password: ""
+milvus_metric: IP
+milvus_index_type: FLAT
+ollama_url: http://localhost:11434
+
+text_collection: jcrag_text_chunks
+image_collection: jcrag_image_chunks
+page_proximity_range: 1
+max_images_per_answer: 4
+
+# Local Ollama models (Google Gemma 4 for chat/vision; nomic for embeddings)
+embedding_model: nomic-embed-text:latest
+embedding_dim: 768
+chat_model: gemma4:12b
+chat_model_fallback: qwen2.5-coder:14b
+vision_model: gemma4:12b
+# Vision captioning is slow/fragile on large PDF corpora; keep false for fast Milvus load
+caption_images: false
+top_k: 5
+chat_num_ctx: 4096
+chat_num_predict: 512
+
+okf_bundle_dir: okf-bundle
+source_pdfs_dir: source_pdfs
+
+brand_image_filter_enabled: true
+brand_image_max_hamming: 10
+low_info_filter_enabled: true
+low_info_max_std: 4.0
+# Drop images that repeat across many pages (headers/footers/watermarks)
+header_footer_filter_enabled: true
+header_footer_min_pages: 2
+header_footer_band_ratio: 0.15
+# If the same image hash appears more than once in a PDF, load NONE of those copies
+drop_duplicate_images: true
+delete_duplicate_image_files: true
+
+chat_history_turns: 6
+ambiguity_score_gap_threshold: 0.03
+
+# Elasticsearch Q&A response cache (1 hour TTL)
+elasticsearch_url: https://localhost:9200
+elasticsearch_user: elastic
+elasticsearch_password: ""
+elasticsearch_verify_certs: false
+elasticsearch_cache_index: okf_qa_cache
+elasticsearch_cache_ttl_seconds: 3600
+elasticsearch_cache_enabled: true
+
+# Relational metadata (SQLite by default; set database_url for Postgres)
+database_path: data/okf_metadata.db
+database_url: ""
+
+# Page-aware ingestion
+page_render_dpi: 150
+ocr_engine: paddleocr
+ocr_enabled: true
+ocr_min_confidence: 0.4
+classify_empty_text_threshold: 40
+
+# Asset registry — store once, keep all occurrences (master prompt policy)
+reuse_duplicate_image_binaries: true
+# Legacy drop-all policy is OFF; occurrences retained
+drop_duplicate_images: false
+delete_duplicate_image_files: false
+index_header_footer_images: false
+
+# Hybrid retrieval
+enable_image_search: true
+hybrid_text_weight: 0.6
+hybrid_image_weight: 0.4
+rrf_k: 60
+rerank_model: ""
+rerank_provider: heuristic
+max_context_chars: 24000
+page_expansion_limit: 2
+query_intent_enabled: true
+
+# Answer-time VLM
+answer_vlm_enabled: true
+answer_vlm_max_images: 2
+
+# Security (Phase 8)
+auth_enabled: false
+jwt_secret: change-me-in-production
+jwt_algorithm: HS256
+default_access_scope: internal
+admin_api_key: ""
+
+# Worker / observability
+ingest_queue_enabled: true
+metrics_enabled: true

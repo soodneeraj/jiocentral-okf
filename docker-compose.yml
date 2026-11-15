@@ -1,0 +1,61 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_ORIGINS: "*"
+    volumes:
+      - ./ollama_models:/root/.ollama
+    networks:
+      - okf-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+      - "7860:7860"
+    volumes:
+      - ./:/app
+    environment:
+      MILVUS_URI: ${MILVUS_URI:-http://host.docker.internal:19530}
+      MILVUS_USER: ${MILVUS_USER:-}
+      MILVUS_PASSWORD: ${MILVUS_PASSWORD:-}
+      OLLAMA_URL: http://ollama:11434
+      DATABASE_PATH: data/okf_metadata.db
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+    networks:
+      - okf-net
+    depends_on:
+      - ollama
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.services.worker"]
+    volumes:
+      - ./:/app
+    environment:
+      MILVUS_URI: ${MILVUS_URI:-http://host.docker.internal:19530}
+      OLLAMA_URL: http://ollama:11434
+      DATABASE_PATH: data/okf_metadata.db
+    networks:
+      - okf-net
+    depends_on:
+      - ollama
+      - api
+    profiles:
+      - workers
+
+networks:
+  okf-net:
+    driver: bridge

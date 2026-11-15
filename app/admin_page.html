@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OKF Admin — PDF Upload</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #9aa8bc;
+      --accent: #3d8bfd;
+      --ok: #3dd68c;
+      --warn: #f5a524;
+      --err: #f31260;
+      --border: #2a3648;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1b2a44, var(--bg));
+      color: var(--text);
+      min-height: 100vh;
+      padding: 2rem 1.25rem 3rem;
+    }
+    main { max-width: 880px; margin: 0 auto; }
+    h1 { margin: 0 0 0.35rem; font-size: 1.75rem; }
+    .sub { color: var(--muted); margin-bottom: 1.5rem; }
+    .card {
+      background: color-mix(in srgb, var(--panel) 92%, black);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.25rem 1.35rem;
+      margin-bottom: 1rem;
+    }
+    label { display: block; font-size: 0.9rem; margin: 0.75rem 0 0.35rem; color: var(--muted); }
+    input[type="file"] {
+      width: 100%;
+      padding: 0.75rem;
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      background: #121821;
+      color: var(--text);
+    }
+    .checks { display: flex; flex-wrap: wrap; gap: 1rem; margin: 1rem 0; }
+    .checks label { display: flex; align-items: center; gap: 0.4rem; margin: 0; color: var(--text); }
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 10px;
+      padding: 0.7rem 1.1rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--accent);
+      color: white;
+      margin-right: 0.5rem;
+      margin-top: 0.5rem;
+    }
+    button.secondary { background: #2a3648; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    #msg { margin-top: 1rem; white-space: pre-wrap; }
+    #status { font-family: ui-monospace, Consolas, monospace; font-size: 0.85rem; color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; }
+    th, td { text-align: left; padding: 0.55rem 0.4rem; border-bottom: 1px solid var(--border); font-size: 0.92rem; }
+    th { color: var(--muted); font-weight: 600; }
+    .pill {
+      display: inline-block;
+      padding: 0.15rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .idle { background: #2a3648; }
+    .running { background: color-mix(in srgb, var(--warn) 30%, transparent); color: var(--warn); }
+    .done { background: color-mix(in srgb, var(--ok) 30%, transparent); color: var(--ok); }
+    .error { background: color-mix(in srgb, var(--err) 30%, transparent); color: var(--err); }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Admin — PDF upload for RAG</h1>
+    <p class="sub">
+      Upload PDFs into <code>source_pdfs/</code>, then ingest → OKF → Milvus.
+      <a href="http://127.0.0.1:7860" target="_blank" rel="noopener">Open chat UI</a>
+    </p>
+
+    <section class="card">
+      <form id="uploadForm">
+        <label for="files">PDF files</label>
+        <input id="files" name="files" type="file" accept=".pdf,application/pdf" multiple required />
+
+        <div class="checks">
+          <label><input type="checkbox" id="force" name="force" /> Force re-ingest</label>
+          <label><input type="checkbox" id="do_index" name="do_index" checked /> Index after ingest</label>
+          <label><input type="checkbox" id="recreate" name="recreate" /> Recreate Milvus collections</label>
+        </div>
+
+        <button type="submit" id="uploadBtn">Upload &amp; Process</button>
+        <button type="button" class="secondary" id="reprocessBtn">Re-process existing</button>
+        <button type="button" class="secondary" id="refreshBtn">Refresh</button>
+      </form>
+      <div id="msg"></div>
+    </section>
+
+    <section class="card">
+      <div>Job status: <span id="statePill" class="pill idle">idle</span></div>
+      <pre id="status"></pre>
+    </section>
+
+    <section class="card">
+      <strong>PDFs in source_pdfs/</strong>
+      <table>
+        <thead><tr><th>Name</th><th>Size (KB)</th><th>Modified</th></tr></thead>
+        <tbody id="pdfBody"><tr><td colspan="3">(loading…)</td></tr></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    const msg = document.getElementById("msg");
+    const statusEl = document.getElementById("status");
+    const statePill = document.getElementById("statePill");
+    const pdfBody = document.getElementById("pdfBody");
+
+    function setMsg(text, ok = true) {
+      msg.style.color = ok ? "var(--ok)" : "var(--err)";
+      msg.textContent = text;
+    }
+
+    async function refresh() {
+      const [pdfsRes, statusRes] = await Promise.all([
+        fetch("/admin/pdfs"),
+        fetch("/admin/status"),
+      ]);
+      const pdfs = await pdfsRes.json();
+      const st = await statusRes.json();
+
+      statePill.textContent = st.state || "idle";
+      statePill.className = "pill " + (st.state || "idle");
+      statusEl.textContent = [
+        st.message || "",
+        "Files: " + ((st.files || []).join(", ") || "(none)"),
+        "Started: " + (st.started_at || "-"),
+        "Finished: " + (st.finished_at || "-"),
+      ].join("\n");
+
+      const rows = pdfs.pdfs || [];
+      if (!rows.length) {
+        pdfBody.innerHTML = '<tr><td colspan="3">(none)</td></tr>';
+      } else {
+        pdfBody.innerHTML = rows.map(r =>
+          `<tr><td>${r.name}</td><td>${r.size_kb}</td><td>${r.modified}</td></tr>`
+        ).join("");
+      }
+    }
+
+    document.getElementById("uploadForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById("uploadBtn");
+      btn.disabled = true;
+      try {
+        const fd = new FormData();
+        const files = document.getElementById("files").files;
+        if (!files.length) {
+          setMsg("Choose at least one PDF.", false);
+          return;
+        }
+        for (const f of files) fd.append("files", f);
+        fd.append("force", document.getElementById("force").checked);
+        fd.append("do_index", document.getElementById("do_index").checked);
+        fd.append("recreate", document.getElementById("recreate").checked);
+        fd.append("process", true);
+
+        const res = await fetch("/admin/upload", { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) {
+          setMsg(JSON.stringify(data), false);
+        } else {
+          setMsg("Saved: " + (data.saved || []).join(", ") + "\nPipeline: " + JSON.stringify(data.job));
+        }
+        await refresh();
+      } catch (err) {
+        setMsg(String(err), false);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById("reprocessBtn").addEventListener("click", async () => {
+      const res = await fetch("/admin/process", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          force: document.getElementById("force").checked,
+          do_index: document.getElementById("do_index").checked,
+          recreate: document.getElementById("recreate").checked,
+        }),
+      });
+      const data = await res.json();
+      setMsg(JSON.stringify(data, null, 2), !!data.accepted);
+      await refresh();
+    });
+
+    document.getElementById("refreshBtn").addEventListener("click", refresh);
+    refresh();
+    setInterval(refresh, 4000);
+  </script>
+</body>
+</html>

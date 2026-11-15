@@ -1,0 +1,26 @@
+"""Shared logging setup for the Open OKF Enterprise RAG project."""
+
+from __future__ import annotations
+
+import logging
+import sys
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Return a module logger with a single stdout StreamHandler.
+
+    Repeated calls never duplicate handlers. propagate is False so a root
+    logger config (if any) does not double-print.
+    """
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter(
+                "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
+            )
+        )
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    return logger

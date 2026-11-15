@@ -1,0 +1,36 @@
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+*.log
+
+# Generated / local content
+source_pdfs/*.pdf
+okf-bundle/concepts/**
+!okf-bundle/concepts/.gitkeep
+okf-bundle/assets/images/**
+!okf-bundle/assets/images/.gitkeep
+okf-bundle/assets/tables/**
+!okf-bundle/assets/tables/.gitkeep
+okf-bundle/_index.md
+
+# Ollama model cache (docker-compose volume)
+ollama_models/
+
+# Local metadata DB and frontend build
+data/
+frontend/node_modules/
+frontend/dist/
+*.db
