@@ -1,4 +1,3 @@
-.env
 __pycache__/
 *.py[cod]
 *$py.class
@@ -29,8 +28,6 @@ okf-bundle/_index.md
 # Ollama model cache (docker-compose volume)
 ollama_models/
 
-# Local metadata DB and frontend build
-data/
+# Frontend build
 frontend/node_modules/
 frontend/dist/
-*.db
