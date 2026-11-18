@@ -209,8 +209,13 @@ def _rewrite_file(path: Path, meta: dict[str, Any], body: str) -> None:
     path.write_text(f"---\n{fm}\n---\n\n{body.strip()}\n", encoding="utf-8")
 
 
-def index_okf(recreate: bool = False) -> dict[str, int]:
-    """Embed every OKF concept into Milvus text/image collections."""
+def index_okf(
+    recreate: bool = False,
+    *,
+    images_only: bool = False,
+    recreate_images: bool = False,
+) -> dict[str, int]:
+    """Embed OKF concepts into Milvus. Optionally reindex images only."""
     cfg = load_config()
     client = get_milvus_client()
     dim = int(cfg["embedding_dim"])
@@ -218,8 +223,15 @@ def index_okf(recreate: bool = False) -> dict[str, int]:
     text_col = cfg["text_collection"]
     image_col = cfg["image_collection"]
 
-    _ensure_collection(client, text_col, dim, metric, recreate)
-    _ensure_collection(client, image_col, dim, metric, recreate)
+    if not images_only:
+        _ensure_collection(client, text_col, dim, metric, recreate)
+    _ensure_collection(
+        client,
+        image_col,
+        dim,
+        metric,
+        recreate or recreate_images,
+    )
 
     text_batch: list[dict[str, Any]] = []
     image_batch: list[dict[str, Any]] = []
@@ -256,6 +268,9 @@ def index_okf(recreate: bool = False) -> dict[str, int]:
             stats["skipped"] += 1
             continue
 
+        if images_only and ctype != "figure":
+            continue
+
         title = str(meta.get("title") or "")
         source = str(meta.get("source") or "")
         source_loc = str(meta.get("source_loc") or "")
@@ -263,6 +278,11 @@ def index_okf(recreate: bool = False) -> dict[str, int]:
         if not isinstance(tags, list):
             tags = [str(tags)]
         page = parse_page_number(source_loc)
+        if not page and meta.get("page") is not None:
+            try:
+                page = int(meta.get("page") or 0)
+            except (TypeError, ValueError):
+                page = 0
         rel_path = str(md_path.relative_to(bundle)).replace("\\", "/")
 
         caption = ""
@@ -299,7 +319,8 @@ def index_okf(recreate: bool = False) -> dict[str, int]:
             # Prefer caption + description + OCR for searchable image text space
             desc = str(meta.get("image_description") or "")
             ocr_txt = str(meta.get("ocr_text") or "")
-            embed_input = f"{title} {caption} {desc} {ocr_txt}".strip()
+            figure_label = str(meta.get("figure_label") or "").strip()
+            embed_input = f"{title} {caption} Fig. {figure_label} {desc} {ocr_txt}".strip()
             try:
                 vector = embed_text(embed_input)
             except Exception as exc:  # noqa: BLE001
@@ -318,6 +339,7 @@ def index_okf(recreate: bool = False) -> dict[str, int]:
                 "file_path": rel_path,
                 "image_path": image_path_rel,
                 "caption": caption,
+                "figure_label": figure_label,
                 "image_description": desc,
                 "ocr_text": ocr_txt,
                 "excluded": bool(meta.get("excluded") is True),
@@ -403,8 +425,22 @@ def main() -> None:
         action="store_true",
         help="Drop and recreate Milvus collections before indexing.",
     )
+    parser.add_argument(
+        "--images-only",
+        action="store_true",
+        help="Only (re)index figure concepts into the image collection.",
+    )
+    parser.add_argument(
+        "--recreate-images",
+        action="store_true",
+        help="Drop and recreate the image collection (use with --images-only).",
+    )
     args = parser.parse_args()
-    index_okf(recreate=args.recreate)
+    index_okf(
+        recreate=args.recreate,
+        images_only=args.images_only,
+        recreate_images=args.recreate_images,
+    )
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ ollama_url: http://localhost:11434
 text_collection: jcrag_text_chunks
 image_collection: jcrag_image_chunks
 page_proximity_range: 1
-max_images_per_answer: 4
+max_images_per_answer: 8
 
 # Local Ollama models (Google Gemma 4 for chat/vision; nomic for embeddings)
 embedding_model: nomic-embed-text:latest
@@ -78,9 +78,14 @@ max_context_chars: 24000
 page_expansion_limit: 2
 query_intent_enabled: true
 
-# Answer-time VLM
-answer_vlm_enabled: true
+# Answer-time VLM (slow on 8GB VRAM — keep false unless needed)
+answer_vlm_enabled: false
 answer_vlm_max_images: 2
+
+# Document-faithful procedure answers (ordered steps + interleaved images)
+document_faithful_answers: true
+faithful_page_window: 1
+faithful_max_images: 12
 
 # Security (Phase 8)
 auth_enabled: false

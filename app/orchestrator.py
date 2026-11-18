@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -10,9 +11,21 @@ import ollama
 from app.cache_es import get_cached_answer, put_cached_answer
 from app.db.models import Conversation, Message
 from app.db.session import get_session, init_db
+from app.faithful import (
+    build_faithful_answer,
+    load_okf_images_for_pages,
+    looks_like_procedure,
+    query_wants_procedure,
+)
 from app.logger import get_logger
 from app.models_registry import get_model_registry
-from app.retrieval import heuristic_rerank, hybrid_retrieve
+from app.retrieval import (
+    expand_contiguous_text,
+    fetch_images_for_pages,
+    heuristic_rerank,
+    hybrid_retrieve,
+    prefer_pipeline_chunks,
+)
 from app.utils import load_config, okf_bundle_dir
 
 logger = get_logger(__name__)
@@ -78,7 +91,8 @@ def _build_images_context(images: list[dict[str, Any]]) -> str:
     for img in images:
         lines.append(
             f"- image_path: {img.get('image_path')} | source: {img.get('source')} | "
-            f"page: {img.get('page')} | caption: {img.get('caption') or img.get('image_description')}"
+            f"page: {img.get('page')} | figure_label: {img.get('figure_label') or ''} | "
+            f"caption: {img.get('caption') or img.get('image_description')}"
         )
     return "\n".join(lines) + "\n"
 
@@ -153,22 +167,53 @@ def _chat(messages: list[dict[str, str]]) -> str:
     )
 
 
-def _validate_citations(answer: str, hits: list[dict[str, Any]], images: list[dict[str, Any]]) -> list[str]:
-    """Return warnings if answer invents sources/pages not in evidence."""
+def re_find_pdfs(text: str) -> list[str]:
+    return re.findall(r"[\w.\-]+\.pdf", text, flags=re.I)
+
+
+def _validate_citations(
+    answer: str, hits: list[dict[str, Any]], images: list[dict[str, Any]]
+) -> list[str]:
     warnings: list[str] = []
     known_sources = {str(h.get("source") or "") for h in hits}
     known_sources |= {str(i.get("source") or "") for i in images}
-    # Soft check: if answer claims a .pdf not in evidence
     for m in re_find_pdfs(answer):
         if m not in known_sources and known_sources:
             warnings.append(f"unverified_source:{m}")
     return warnings
 
 
-def re_find_pdfs(text: str) -> list[str]:
-    import re
-
-    return re.findall(r"[\w.\-]+\.pdf", text, flags=re.I)
+def _build_evidence_map(
+    text_hits: list[dict[str, Any]],
+    images: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    cfg = load_config()
+    evidence_map = []
+    for h in text_hits[:3]:
+        page = int(h.get("page") or 0)
+        source = str(h.get("source") or "")
+        evidence_map.append(
+            {
+                "citation": format_citation(h),
+                "source": source,
+                "page": page,
+                "type": h.get("type"),
+                "title": h.get("title"),
+                "images": [
+                    {
+                        "image_path": img.get("image_path"),
+                        "caption": img.get("caption") or img.get("image_description"),
+                        "figure_label": img.get("figure_label"),
+                        "page": img.get("page"),
+                    }
+                    for img in images
+                    if str(img.get("source") or "") == source
+                    and abs(int(img.get("page") or 0) - page)
+                    <= int(cfg.get("page_proximity_range", 1))
+                ],
+            }
+        )
+    return evidence_map
 
 
 def rag_answer(
@@ -189,76 +234,104 @@ def rag_answer(
     max_chars = int(cfg.get("max_context_chars", 24000))
     max_images = int(cfg.get("max_images_per_answer", 4))
     history_turns = int(cfg.get("chat_history_turns", 6))
+    faithful_max = int(cfg.get("faithful_max_images", 12))
 
     retrieved = hybrid_retrieve(
         query, top_k=top_k, history=history, access_scopes=access_scopes
     )
-    text_hits = heuristic_rerank(retrieved["text_hits"])
-    images = retrieved.get("expanded_images") or []
-    # Prefer fused image hits that are relevant
-    for item in retrieved.get("fused") or []:
-        if item["modality"] == "image":
+    text_hits = prefer_pipeline_chunks(heuristic_rerank(retrieved["text_hits"]))
+
+    best_source = str(text_hits[0].get("source") or "") if text_hits else ""
+    allowed_sources = {best_source} if best_source else set()
+
+    # Expand contiguous pages for document-faithful assembly
+    use_faithful = bool(cfg.get("document_faithful_answers", True)) and bool(text_hits)
+    if use_faithful:
+        text_hits = expand_contiguous_text(text_hits)
+        pages = sorted({int(h.get("page") or 0) for h in text_hits if int(h.get("page") or 0) > 0})
+        images = fetch_images_for_pages(best_source, pages, limit=faithful_max)
+        if not images:
+            images = load_okf_images_for_pages(best_source, pages)
+        elif len(images) < 2:
+            # Merge any OKF figures Milvus missed (e.g. mid-reindex)
+            seen = {str(i.get("image_path") or "") for i in images}
+            for extra in load_okf_images_for_pages(best_source, pages):
+                ip = str(extra.get("image_path") or "")
+                if ip and ip not in seen:
+                    images.append(extra)
+                    seen.add(ip)
+    else:
+        images = [
+            img
+            for img in (retrieved.get("expanded_images") or [])
+            if str(img.get("source") or "") in allowed_sources
+        ]
+        for item in retrieved.get("fused") or []:
+            if item["modality"] != "image":
+                continue
             p = item["payload"]
+            if str(p.get("source") or "") not in allowed_sources:
+                continue
             ip = str(p.get("image_path") or "")
             if ip and all(str(i.get("image_path")) != ip for i in images):
                 images.append(p)
             if len(images) >= max_images:
                 break
-    images = images[:max_images]
+        images = images[:max_images]
 
-    context = _build_context(text_hits, max_chars)
-    images_context = _build_images_context(images)
-    vlm_context = _vlm_interpret(
-        images, query, int(cfg.get("answer_vlm_max_images", 2))
-    )
+    images = [i for i in images if str(i.get("source") or "") in allowed_sources or not allowed_sources]
 
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        ambiguity_rule="",
-        context=context or "(no matching passages)",
-        images_context=images_context,
-        vlm_context=vlm_context,
-    )
-    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    if history:
-        trimmed = [m for m in history if m.get("role") in {"user", "assistant"}][
-            -history_turns:
-        ]
-        messages.extend(trimmed)
-    messages.append({"role": "user", "content": query})
+    # Prefer reconstruction for procedures
+    faithful = None
+    if use_faithful:
+        procedural_evidence = any(
+            looks_like_procedure(str(h.get("body") or "")) for h in text_hits
+        ) or query_wants_procedure(query)
+        if procedural_evidence:
+            faithful = build_faithful_answer(text_hits, images, query=query)
 
-    answer = _chat(messages)
-    if text_hits and "not found in approved okf bundle" not in answer.lower():
-        best = text_hits[0]
-        answer = (
-            f"{answer}\n\n---\n**Exact source text** [{format_citation(best)}]:\n\n"
-            f"{str(best.get('body') or '')}"
+    mode = "llm"
+    steps: list[dict[str, Any]] = []
+    images_interleaved = False
+
+    if faithful and faithful.get("answer"):
+        answer = str(faithful["answer"])
+        images = list(faithful.get("images") or images)
+        steps = list(faithful.get("steps") or [])
+        mode = "document_faithful"
+        images_interleaved = True
+    else:
+        context = _build_context(text_hits, max_chars)
+        images_context = _build_images_context(images[:max_images])
+        # Skip VLM on faithful path; for LLM path respect config (default off recommended)
+        vlm_context = _vlm_interpret(
+            images, query, int(cfg.get("answer_vlm_max_images", 2))
         )
+
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+            ambiguity_rule="",
+            context=context or "(no matching passages)",
+            images_context=images_context,
+            vlm_context=vlm_context,
+        )
+        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        if history:
+            trimmed = [m for m in history if m.get("role") in {"user", "assistant"}][
+                -history_turns:
+            ]
+            messages.extend(trimmed)
+        messages.append({"role": "user", "content": query})
+
+        answer = _chat(messages)
+        if text_hits and "not found in approved okf bundle" not in answer.lower():
+            best = text_hits[0]
+            answer = (
+                f"{answer}\n\n---\n**Exact source text** [{format_citation(best)}]:\n\n"
+                f"{str(best.get('body') or '')}"
+            )
 
     warnings = _validate_citations(answer, text_hits, images)
-    evidence_map = []
-    for h in text_hits[:3]:
-        page = int(h.get("page") or 0)
-        source = str(h.get("source") or "")
-        evidence_map.append(
-            {
-                "citation": format_citation(h),
-                "source": source,
-                "page": page,
-                "type": h.get("type"),
-                "title": h.get("title"),
-                "images": [
-                    {
-                        "image_path": img.get("image_path"),
-                        "caption": img.get("caption") or img.get("image_description"),
-                        "page": img.get("page"),
-                    }
-                    for img in images
-                    if str(img.get("source") or "") == source
-                    and abs(int(img.get("page") or 0) - page)
-                    <= int(cfg.get("page_proximity_range", 1))
-                ],
-            }
-        )
+    evidence_map = _build_evidence_map(text_hits, images)
 
     result = {
         "answer": answer,
@@ -269,20 +342,24 @@ def rag_answer(
         else [],
         "images": images,
         "evidence_map": evidence_map,
+        "steps": steps,
+        "mode": mode,
+        "images_interleaved": images_interleaved,
         "intent": retrieved.get("intent"),
         "warnings": warnings,
         "cache": "miss",
         "conversation_id": conversation_id,
     }
 
-    # Persist conversation if requested
     try:
         with get_session() as session:
             conv = None
             if conversation_id:
                 conv = session.get(Conversation, conversation_id)
             if conv is None:
-                conv = Conversation(id=conversation_id or str(uuid4()), user_id=user_id, title=query[:80])
+                conv = Conversation(
+                    id=conversation_id or str(uuid4()), user_id=user_id, title=query[:80]
+                )
                 session.add(conv)
                 session.flush()
             session.add(Message(conversation_id=conv.id, role="user", content=query))
@@ -297,6 +374,8 @@ def rag_answer(
                             {"image_path": i.get("image_path"), "page": i.get("page")}
                             for i in images
                         ],
+                        "mode": mode,
+                        "steps": steps,
                     },
                 )
             )

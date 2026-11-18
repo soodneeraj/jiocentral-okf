@@ -39,6 +39,7 @@ IMAGE_OUTPUT_FIELDS = [
     "section",
     "excluded",
     "caption",
+    "figure_label",
     "image_role",
 ]
 

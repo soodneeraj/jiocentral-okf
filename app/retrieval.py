@@ -63,6 +63,7 @@ IMAGE_FIELDS = [
     "section",
     "excluded",
     "caption",
+    "figure_label",
     "image_role",
     "occurrence_id",
     "global_image_asset_id",
@@ -292,3 +293,156 @@ def heuristic_rerank(text_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return (is_table, low, -float(h.get("distance") or 0))
 
     return sorted(text_hits, key=key)
+
+
+def _is_pipeline_chunk(hit: dict[str, Any]) -> bool:
+    """Prefer structured pipeline OKF over legacy pymupdf duplicates."""
+    if str(hit.get("chunk_id") or "").strip():
+        return True
+    tags = hit.get("tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    tag_set = {str(t).lower() for t in tags}
+    if "pymupdf" in tag_set:
+        return False
+    related = hit.get("associated_image_ids") or []
+    return bool(related)
+
+
+def prefer_pipeline_chunks(text_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Drop legacy pymupdf duplicates when a pipeline chunk covers the same
+    source+page (or identical body prefix).
+    """
+    if not text_hits:
+        return text_hits
+    by_page: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for h in text_hits:
+        key = (str(h.get("source") or ""), int(h.get("page") or 0))
+        by_page.setdefault(key, []).append(h)
+
+    kept_ids: set[int] = set()
+    out: list[dict[str, Any]] = []
+    for group in by_page.values():
+        pipeline = [h for h in group if _is_pipeline_chunk(h)]
+        chosen = pipeline if pipeline else group
+        for h in chosen:
+            oid = id(h)
+            if oid in kept_ids:
+                continue
+            kept_ids.add(oid)
+            out.append(h)
+    # Preserve original relative order among survivors
+    order = {id(h): i for i, h in enumerate(text_hits)}
+    out.sort(key=lambda h: order.get(id(h), 10**9))
+    return out
+
+
+def fetch_text_by_source_pages(
+    source: str,
+    pages: list[int],
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Query Milvus text collection for exact source + page set."""
+    if not source or not pages:
+        return []
+    cfg = load_config()
+    client = get_milvus_client()
+    safe = source.replace('"', '\\"')
+    page_list = ", ".join(str(int(p)) for p in sorted(set(pages)) if int(p) > 0)
+    if not page_list:
+        return []
+    filt = f'source == "{safe}" and page in [{page_list}]'
+    try:
+        rows = client.query(
+            collection_name=cfg["text_collection"],
+            filter=filt,
+            output_fields=TEXT_FIELDS,
+            limit=limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch_text_by_source_pages failed: %s", exc)
+        return []
+    return list(rows or [])
+
+
+def expand_contiguous_text(
+    text_hits: list[dict[str, Any]],
+    *,
+    window: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Expand around the best hit to contiguous same-source pages, sorted by
+    document reading order (page, file_path). Prefers pipeline chunks.
+    """
+    if not text_hits:
+        return text_hits
+    cfg = load_config()
+    win = int(window if window is not None else cfg.get("faithful_page_window", 1))
+    best = text_hits[0]
+    source = str(best.get("source") or "")
+    center = int(best.get("page") or 0)
+    if not source or center <= 0:
+        return prefer_pipeline_chunks(text_hits)
+
+    pages = list(range(max(1, center - win), center + win + 1))
+    fetched = fetch_text_by_source_pages(source, pages)
+    merged: dict[str, dict[str, Any]] = {}
+
+    def _key(h: dict[str, Any]) -> str:
+        return (
+            str(h.get("content_hash") or "")
+            or str(h.get("chunk_id") or "")
+            or str(h.get("file_path") or "")
+            or f"{h.get('page')}:{str(h.get('body') or '')[:80]}"
+        )
+
+    for h in text_hits:
+        if str(h.get("source") or "") == source:
+            merged[_key(h)] = h
+    for h in fetched:
+        merged[_key(h)] = h
+
+    combined = prefer_pipeline_chunks(list(merged.values()))
+
+    def sort_key(h: dict[str, Any]) -> tuple[int, int, str]:
+        page = int(h.get("page") or 0)
+        # pipeline first within page
+        pipe = 0 if _is_pipeline_chunk(h) else 1
+        return (page, pipe, str(h.get("file_path") or ""))
+
+    ordered = sorted(combined, key=sort_key)
+    # Keep only the chosen source pages in window
+    ordered = [
+        h
+        for h in ordered
+        if str(h.get("source") or "") == source and int(h.get("page") or 0) in set(pages)
+    ]
+    return ordered or prefer_pipeline_chunks(text_hits)
+
+
+def fetch_images_for_pages(
+    source: str,
+    pages: list[int],
+    *,
+    limit: int = 40,
+) -> list[dict[str, Any]]:
+    """Load all non-excluded images for exact pages (document-faithful path)."""
+    from app.chat import find_related_images
+
+    if not source or not pages:
+        return []
+    collected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for page in sorted(set(int(p) for p in pages if int(p) > 0)):
+        # exact page: temporarily rely on proximity 0 via filter in find_related
+        imgs = find_related_images(source, page, limit=limit)
+        for img in imgs:
+            if int(img.get("page") or 0) != page:
+                continue
+            ip = str(img.get("image_path") or "")
+            if ip and ip not in seen:
+                seen.add(ip)
+                collected.append(img)
+    return collected
