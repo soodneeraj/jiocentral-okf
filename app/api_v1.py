@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -14,13 +13,12 @@ from app.admin import save_uploaded_pdfs
 from app.chat import rag_answer
 from app.db.models import Conversation, Document, ImageAsset, ImageOccurrence, Message
 from app.db.session import get_session, init_db
-from app.index import delete_by_document_id
 from app.manifest import document_status_payload
 from app.models_registry import get_model_registry
 from app.security import get_current_user, issue_token, verify_password
 from app.services.metrics import snapshot as metrics_snapshot
 from app.services.worker import get_worker
-from app.utils import okf_bundle_dir, source_pdfs_dir
+from app.utils import okf_bundle_dir
 
 router = APIRouter(prefix="/api/v1")
 
@@ -35,6 +33,25 @@ class ChatQueryRequest(BaseModel):
     conversation_id: str | None = None
     top_k: int = 10
     history: list[dict[str, str]] = Field(default_factory=list)
+    mode: str | None = None
+
+
+class TransformRequest(BaseModel):
+    action: str  # regenerate | shorter | detailed | simpler
+    query: str
+    answer: str = ""
+    excerpts: str = ""
+    conversation_id: str | None = None
+    history: list[dict[str, str]] = Field(default_factory=list)
+    top_k: int = 10
+
+
+class FeedbackRequest(BaseModel):
+    rating: str  # up | down
+    conversation_id: str | None = None
+    message_id: str | None = None
+    query: str = ""
+    note: str = ""
 
 
 class ProcessBody(BaseModel):
@@ -177,18 +194,13 @@ def delete_document(document_id: str, user: dict[str, Any] = Depends(get_current
         d = session.get(Document, document_id)
         if not d:
             raise HTTPException(status_code=404, detail="Document not found")
-        name = d.name
         filename = d.original_filename
-        session.delete(d)
-    milvus = delete_by_document_id(document_id)
-    # Best-effort OKF cleanup
-    concepts = okf_bundle_dir() / "concepts" / name
-    if concepts.exists():
-        shutil.rmtree(concepts, ignore_errors=True)
-    pdf = source_pdfs_dir() / filename
-    if pdf.exists():
-        pdf.unlink(missing_ok=True)
-    return {"deleted": document_id, "milvus": milvus}
+    from app.admin import purge_source_pdf
+
+    result = purge_source_pdf(filename)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("detail") or "Delete failed")
+    return {"deleted": document_id, "purge": result}
 
 
 @router.post("/documents/process")
@@ -237,8 +249,51 @@ def chat_query(
             conversation_id=body.conversation_id,
             user_id=str(user.get("username") or "anonymous"),
             access_scopes=list(user.get("access_scopes") or []),
+            mode=body.mode,
         )
     return result
+
+
+@router.post("/chat/transform")
+def chat_transform(
+    body: TransformRequest,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    from app.answer_actions import transform_answer
+
+    action = (body.action or "").strip().lower()
+    if action not in {"regenerate", "shorter", "detailed", "simpler"}:
+        raise HTTPException(status_code=400, detail="Invalid action")
+    return transform_answer(
+        action=action,  # type: ignore[arg-type]
+        query=body.query,
+        answer=body.answer,
+        excerpts=body.excerpts,
+        history=body.history or None,
+        conversation_id=body.conversation_id,
+        user_id=str(user.get("username") or "anonymous"),
+        top_k=body.top_k,
+    )
+
+
+@router.post("/chat/feedback")
+def chat_feedback(
+    body: FeedbackRequest,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    from app.answer_actions import save_feedback
+
+    rating = (body.rating or "").strip().lower()
+    if rating not in {"up", "down"}:
+        raise HTTPException(status_code=400, detail="rating must be up or down")
+    return save_feedback(
+        rating=rating,  # type: ignore[arg-type]
+        conversation_id=body.conversation_id,
+        message_id=body.message_id,
+        query=body.query,
+        note=body.note,
+        user_id=str(user.get("username") or "anonymous"),
+    )
 
 
 @router.get("/chat/conversations")

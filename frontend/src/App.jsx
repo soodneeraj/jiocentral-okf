@@ -5,7 +5,7 @@ const API = "";
 const PROGRESS_STEPS = [
   "Understanding your question…",
   "Searching document text…",
-  "Searching figures and diagrams…",
+  "Searching figures…",
   "Assembling evidence…",
   "Generating grounded answer…",
 ];
@@ -13,7 +13,11 @@ const PROGRESS_STEPS = [
 function imageUrl(path) {
   if (!path) return "";
   if (path.startsWith("http") || path.startsWith("/")) return path;
-  return `/static/bundle/${path}`;
+  const name = path.split("/").pop();
+  if (name && /\.(png|jpe?g|webp|gif|bmp|svg)$/i.test(name)) {
+    return `/static/images/${encodeURIComponent(name)}`;
+  }
+  return `/static/bundle/${path.split("/").map(encodeURIComponent).join("/")}`;
 }
 
 function formatDuration(ms) {
@@ -26,8 +30,23 @@ function formatDuration(ms) {
   return `${m}m ${s}s`;
 }
 
+function renderInline(text) {
+  if (!text) return null;
+  // Minimal markdown: **bold**, *italic*, newlines
+  const escaped = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  const withMd = escaped
+    .replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>")
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*\n]+?)\*/g, "<em>$1</em>")
+    .replace(/\n/g, "<br/>");
+  return <span dangerouslySetInnerHTML={{ __html: withMd }} />;
+}
+
 export default function App() {
-  const [docs, setDocs] = useState([]);
+  const [conversations, setConversations] = useState([]);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -35,42 +54,25 @@ export default function App() {
   const [progressStep, setProgressStep] = useState(0);
   const [conversationId, setConversationId] = useState(null);
   const [lightbox, setLightbox] = useState(null);
-  const [job, setJob] = useState(null);
-  const [health, setHealth] = useState(null);
+  const [docHtmlParts, setDocHtmlParts] = useState(null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const messagesEndRef = useRef(null);
   const tickRef = useRef(null);
   const stepRef = useRef(null);
 
-  const refreshDocs = useCallback(async () => {
+  const refreshConversations = useCallback(async () => {
     try {
-      const res = await fetch(`${API}/api/v1/documents`);
+      const res = await fetch(`${API}/api/v1/chat/conversations`);
       const data = await res.json();
-      setDocs(data.documents || []);
+      setConversations(data.conversations || []);
     } catch (e) {
       console.error(e);
     }
   }, []);
 
   useEffect(() => {
-    refreshDocs();
-    fetch(`${API}/api/v1/health`)
-      .then((r) => r.json())
-      .then(setHealth)
-      .catch(() => {});
-  }, [refreshDocs]);
-
-  useEffect(() => {
-    if (!job?.id || job.state === "done" || job.state === "error") return;
-    const t = setInterval(async () => {
-      const res = await fetch(`${API}/api/v1/jobs/${job.id}`);
-      const data = await res.json();
-      setJob(data);
-      if (data.state === "done" || data.state === "error") {
-        refreshDocs();
-      }
-    }, 2000);
-    return () => clearInterval(t);
-  }, [job, refreshDocs]);
+    refreshConversations();
+  }, [refreshConversations]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -100,23 +102,50 @@ export default function App() {
     }, 4500);
   }
 
-  async function onUpload(e) {
-    const files = e.target.files;
-    if (!files?.length) return;
-    const fd = new FormData();
-    for (const f of files) fd.append("files", f);
-    setBusy(true);
+  function newChat() {
+    clearProgressTimers();
+    setMessages([]);
+    setConversationId(null);
+    setDocHtmlParts(null);
+    setBusy(false);
+    setProgressElapsedMs(0);
+    setInput("");
+  }
+
+  async function openConversation(id) {
+    if (!id || busy) return;
     try {
-      const res = await fetch(
-        `${API}/api/v1/documents/upload?process=true&do_index=true`,
-        { method: "POST", body: fd }
-      );
+      const res = await fetch(`${API}/api/v1/chat/conversations/${id}`);
+      if (!res.ok) return;
       const data = await res.json();
-      setJob(data.job);
-      await refreshDocs();
-    } finally {
-      setBusy(false);
-      e.target.value = "";
+      setConversationId(data.conversation_id);
+      const mapped = (data.messages || []).map((m) => {
+        const evidence = m.evidence || {};
+        return {
+          role: m.role,
+          content: m.content || "",
+          sources: evidence.sources || [],
+          images: evidence.images || [],
+        };
+      });
+      setMessages(mapped);
+      const lastAi = [...mapped].reverse().find((m) => m.role === "assistant");
+      setDocHtmlParts(lastAi || null);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  async function deleteConversation(id, e) {
+    e?.stopPropagation?.();
+    if (!id) return;
+    if (!window.confirm("Delete this chat?")) return;
+    try {
+      await fetch(`${API}/api/v1/chat/conversations/${id}`, { method: "DELETE" });
+      if (conversationId === id) newChat();
+      await refreshConversations();
+    } catch (err) {
+      console.error(err);
     }
   }
 
@@ -145,28 +174,22 @@ export default function App() {
       const data = await res.json();
       const elapsedMs = performance.now() - t0;
       if (data.conversation_id) setConversationId(data.conversation_id);
-      setMessages((m) => [
-        ...m,
-        {
-          role: "assistant",
-          content: data.answer || "",
-          sources: data.sources || [],
-          images: data.images || [],
-          evidence_map: data.evidence_map || [],
-          warnings: data.warnings || [],
-          intent: data.intent,
-          elapsedMs,
-        },
-      ]);
+      const assistantMsg = {
+        role: "assistant",
+        content: data.answer || "",
+        sources: data.sources || [],
+        images: data.images || [],
+        warnings: data.warnings || [],
+        elapsedMs,
+      };
+      setMessages((m) => [...m, assistantMsg]);
+      setDocHtmlParts(assistantMsg);
+      await refreshConversations();
     } catch (err) {
       const elapsedMs = performance.now() - t0;
       setMessages((m) => [
         ...m,
-        {
-          role: "assistant",
-          content: `Error: ${err.message}`,
-          elapsedMs,
-        },
+        { role: "assistant", content: `Error: ${err.message}`, elapsedMs },
       ]);
     } finally {
       clearProgressTimers();
@@ -176,179 +199,180 @@ export default function App() {
     }
   }
 
-  function newChat() {
-    clearProgressTimers();
-    setMessages([]);
-    setConversationId(null);
-    setBusy(false);
-    setProgressElapsedMs(0);
-  }
-
   const latestImages = useMemo(() => {
+    if (docHtmlParts?.images?.length) return docHtmlParts.images;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].images?.length) return messages[i].images;
     }
     return [];
-  }, [messages]);
+  }, [messages, docHtmlParts]);
 
   return (
-    <div className="app">
+    <div className={`app ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
       <aside className="sidebar">
-        <div className="brand">OKF Multimodal RAG</div>
-        <div className="sub">On-premise document intelligence</div>
-        <button onClick={newChat} style={{ width: "100%", marginBottom: 12 }}>
-          New conversation
-        </button>
-        <div className="upload-row">
-          <label className="btn secondary" style={{ textAlign: "center" }}>
-            Upload PDFs
-            <input
-              type="file"
-              accept="application/pdf"
-              multiple
-              hidden
-              onChange={onUpload}
-            />
-          </label>
-          {job && (
-            <div className="job-item">
-              Job {job.id?.slice?.(0, 8) || job.id}:{" "}
-              <span className="status">{job.state}</span>
-              <div>{job.message}</div>
-            </div>
-          )}
+        <div className="side-top">
+          <div className="brand">OKF Chat</div>
+          <button className="icon-btn" onClick={() => setSidebarOpen(false)} title="Collapse">
+            ‹
+          </button>
         </div>
-        <div className="sub">Documents</div>
-        {docs.map((d) => (
-          <div className="doc-item" key={d.document_id}>
-            <div>{d.original_filename || d.name}</div>
-            <div className="status">
-              {d.processing_status} · type {d.document_type} · {d.page_count}p
+        <button className="new-chat" onClick={newChat}>
+          + New chat
+        </button>
+        <div className="hist-label">Chat history</div>
+        <div className="hist-list">
+          {conversations.length === 0 && (
+            <div className="hist-empty">No chats yet</div>
+          )}
+          {conversations.map((c) => (
+            <div
+              key={c.conversation_id}
+              className={`hist-item ${
+                c.conversation_id === conversationId ? "active" : ""
+              }`}
+              onClick={() => openConversation(c.conversation_id)}
+            >
+              <span className="hist-title">{c.title || "Untitled"}</span>
+              <button
+                className="hist-del"
+                title="Delete"
+                onClick={(e) => deleteConversation(c.conversation_id, e)}
+              >
+                ×
+              </button>
             </div>
-          </div>
-        ))}
-        {health && (
-          <div className="doc-item" style={{ marginTop: 16 }}>
-            <div>Milvus: {String(health.milvus)}</div>
-            <div className="status">
-              Models: {health.models?.ollama_reachable ? "reachable" : "down"}
-            </div>
-          </div>
-        )}
+          ))}
+        </div>
+        <div className="side-foot">
+          <a href="/admin" target="_blank" rel="noopener">
+            Admin
+          </a>
+        </div>
       </aside>
+
+      {!sidebarOpen && (
+        <button className="reopen" onClick={() => setSidebarOpen(true)} title="History">
+          ☰
+        </button>
+      )}
 
       <main className="main">
         <div className="messages">
           {messages.length === 0 && !busy && (
-            <div className="bubble ai">
-              Ask questions across your authorized PDF repository. Answers include
-              page citations and original figures when relevant.
+            <div className="hero">
+              <h1>How can I help?</h1>
+              <p>Ask about procedures, steps, and figures in your approved documents.</p>
             </div>
           )}
           {messages.map((m, idx) => (
             <React.Fragment key={idx}>
-              <div className={`bubble ${m.role === "user" ? "user" : "ai"}`}>
-                {m.content}
-                {m.role === "assistant" && m.elapsedMs != null && (
-                  <div className="meta-time">
-                    Response time: {formatDuration(m.elapsedMs)}
-                  </div>
-                )}
-                {m.intent && (
-                  <div className="status" style={{ marginTop: 8 }}>
-                    Intent: {m.intent}
-                  </div>
-                )}
-                {m.warnings?.length > 0 && (
-                  <div className="warn">Warnings: {m.warnings.join(", ")}</div>
-                )}
-              </div>
-              {m.role === "assistant" && (m.sources?.length > 0 || m.images?.length > 0) && (
-                <div className="bubble evidence">
-                  <strong>Document-supported evidence</strong>
-                  {(m.sources || []).map((s, i) => (
-                    <div key={i}>
-                      {s.source} {s.source_loc}
-                      {s.page != null ? ` (page ${s.page})` : ""}
+              <div className={`row ${m.role}`}>
+                <div className={`bubble ${m.role === "user" ? "user" : "ai"}`}>
+                  {renderInline(m.content)}
+                  {m.role === "assistant" && m.elapsedMs != null && (
+                    <div className="meta-time">
+                      {formatDuration(m.elapsedMs)}
                     </div>
-                  ))}
-                  <div className="thumbs" style={{ marginTop: 8 }}>
-                    {(m.images || []).map((img, i) => (
-                      <img
-                        key={i}
-                        src={imageUrl(img.image_path)}
-                        alt={img.caption || "figure"}
-                        onClick={() => setLightbox(imageUrl(img.image_path))}
-                      />
-                    ))}
-                  </div>
+                  )}
+                  {m.warnings?.length > 0 && (
+                    <div className="warn">Warnings: {m.warnings.join(", ")}</div>
+                  )}
                 </div>
-              )}
+              </div>
+              {m.role === "assistant" &&
+                (m.sources?.length > 0 || m.images?.length > 0) && (
+                  <div className="row assistant">
+                    <div className="bubble evidence">
+                      <strong>Sources</strong>
+                      {(m.sources || []).map((s, i) => (
+                        <div key={i}>
+                          {s.source} {s.source_loc}
+                          {s.page != null ? ` (page ${s.page})` : ""}
+                        </div>
+                      ))}
+                      {(m.images || []).length > 0 && (
+                        <div className="thumbs" style={{ marginTop: 8 }}>
+                          {(m.images || []).map((img, i) => (
+                            <img
+                              key={i}
+                              src={imageUrl(img.image_path)}
+                              alt={img.caption || "figure"}
+                              onClick={() => setLightbox(imageUrl(img.image_path))}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
             </React.Fragment>
           ))}
 
           {busy && (
-            <div className="bubble progress" aria-live="polite" aria-busy="true">
-              <div className="progress-row">
-                <span className="spinner" aria-hidden="true" />
-                <div>
-                  <div className="progress-title">Generating response…</div>
-                  <div className="progress-step">{PROGRESS_STEPS[progressStep]}</div>
-                  <div className="progress-timer">
-                    Elapsed: {formatDuration(progressElapsedMs)}
+            <div className="row assistant">
+              <div className="bubble progress" aria-live="polite" aria-busy="true">
+                <div className="progress-row">
+                  <span className="spinner" aria-hidden="true" />
+                  <div>
+                    <div className="progress-title">Generating response…</div>
+                    <div className="progress-step">{PROGRESS_STEPS[progressStep]}</div>
+                    <div className="progress-timer">
+                      Elapsed: {formatDuration(progressElapsedMs)}
+                    </div>
                   </div>
                 </div>
-              </div>
-              <div className="progress-bar">
-                <div
-                  className="progress-bar-fill"
-                  style={{
-                    width: `${Math.min(92, 12 + progressStep * 18 + (progressElapsedMs % 3000) / 120)}%`,
-                  }}
-                />
               </div>
             </div>
           )}
           <div ref={messagesEndRef} />
         </div>
-        <div className="composer">
-          <textarea
-            value={input}
-            placeholder={busy ? "Waiting for response…" : "Ask a question about your documents…"}
-            disabled={busy}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                send();
-              }
-            }}
-          />
-          <button onClick={send} disabled={busy || !input.trim()}>
-            {busy ? "Working…" : "Send"}
-          </button>
+
+        <div className="composer-wrap">
+          <div className="composer">
+            <textarea
+              value={input}
+              placeholder={busy ? "Waiting for response…" : "Message OKF…"}
+              disabled={busy}
+              rows={1}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send();
+                }
+              }}
+            />
+            <button onClick={send} disabled={busy || !input.trim()}>
+              {busy ? "…" : "Send"}
+            </button>
+          </div>
+          <div className="composer-hint">Enter to send · Shift+Enter for newline</div>
         </div>
       </main>
 
       <aside className="rail">
-        <div className="sub">Relevant images</div>
-        <div className="thumbs">
-          {latestImages.map((img, i) => (
-            <div key={i}>
-              <img
-                src={imageUrl(img.image_path)}
-                alt=""
-                onClick={() => setLightbox(imageUrl(img.image_path))}
-              />
-              <div className="status">
-                p{img.page} · {img.source || ""}
+        <div className="rail-title">Document view</div>
+        <div className="rail-body">
+          {!docHtmlParts && (
+            <p className="muted">Formatted answer content and figures appear here.</p>
+          )}
+          {docHtmlParts && (
+            <>
+              <div className="rail-answer">{renderInline(docHtmlParts.content)}</div>
+              <div className="thumbs">
+                {latestImages.map((img, i) => (
+                  <div key={i}>
+                    <img
+                      src={imageUrl(img.image_path)}
+                      alt=""
+                      onClick={() => setLightbox(imageUrl(img.image_path))}
+                    />
+                    <div className="muted">p{img.page}</div>
+                  </div>
+                ))}
               </div>
-            </div>
-          ))}
-        </div>
-        <div className="sub" style={{ marginTop: 16 }}>
-          Open source PDF at cited page via your PDF viewer using page numbers
-          shown in evidence.
+            </>
+          )}
         </div>
       </aside>
 

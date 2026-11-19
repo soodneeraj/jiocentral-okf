@@ -15,6 +15,8 @@ from PIL import Image
 
 from app.logger import get_logger
 from app.okf_spec import create_index_file
+from app.assets import pixmap_to_pil
+from app.image_chrome import chrome_skip_reason
 from app.utils import (
     concepts_dir,
     ensure_parent,
@@ -80,14 +82,36 @@ def _hamming_distance(a: int, b: int) -> int:
     return (a ^ b).bit_count()
 
 
-def _grayscale_std(img: Image.Image) -> float:
+def _grayscale_stats(img: Image.Image) -> tuple[float, float]:
     gray = img.convert("L")
     pixels = list(gray.getdata())
     if not pixels:
-        return 0.0
+        return 0.0, 0.0
     mean = sum(pixels) / len(pixels)
     variance = sum((p - mean) ** 2 for p in pixels) / len(pixels)
-    return variance ** 0.5
+    return mean, variance ** 0.5
+
+
+def _grayscale_std(img: Image.Image) -> float:
+    return _grayscale_stats(img)[1]
+
+
+def is_blank_image(img: Image.Image, *, max_std: float = 5.0) -> bool:
+    """True for empty/near-empty image objects (blank plates, spacers)."""
+    if img is None:
+        return True
+    w, h = img.size
+    if w < 24 or h < 24:
+        return True
+    mean, std = _grayscale_stats(img)
+    if std < max_std:
+        return True
+    if mean >= 250.0 or mean <= 5.0:
+        return True
+    gray = img.convert("L")
+    pixels = list(gray.getdata())
+    near_white = sum(1 for p in pixels if p >= 248) / max(1, len(pixels))
+    return near_white >= 0.985
 
 
 class EnterpriseOKFIngestor:
@@ -133,12 +157,36 @@ class EnterpriseOKFIngestor:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to load reference image %s: %s", path, exc)
 
-    def _skip_reason(self, img: Image.Image) -> str | None:
-        """Return skip reason ('blank'/'brand') or None if image should be kept."""
+    def _skip_reason(
+        self,
+        img: Image.Image,
+        *,
+        bbox: dict[str, Any] | None = None,
+        page_width: float = 0.0,
+        page_height: float = 0.0,
+        is_cross_page_repeat: bool = False,
+        is_duplicate_hash: bool = False,
+    ) -> str | None:
+        """Return skip reason or None if image should be kept.
+
+        Header/footer/decorative chrome rejection is non-negotiable.
+        """
         cfg = self.cfg
+        band = float(cfg.get("header_footer_band_ratio", 0.18))
+        chrome = chrome_skip_reason(
+            img,
+            bbox=bbox,
+            page_width=page_width,
+            page_height=page_height,
+            band_ratio=max(0.12, band),
+            is_cross_page_repeat=is_cross_page_repeat,
+            is_duplicate_hash=is_duplicate_hash,
+        )
+        if chrome:
+            return chrome
         if cfg.get("low_info_filter_enabled", True):
-            max_std = float(cfg.get("low_info_max_std", 4.0))
-            if _grayscale_std(img) < max_std:
+            max_std = float(cfg.get("low_info_max_std", 5.0))
+            if is_blank_image(img, max_std=max_std):
                 return "blank"
 
         if cfg.get("brand_image_filter_enabled", True) and self._reference_hashes:
@@ -256,43 +304,57 @@ class EnterpriseOKFIngestor:
         # Pass 1: decode candidates and count perceptual hashes across pages
         candidates: list[dict[str, Any]] = []
         hash_pages: dict[int, set[int]] = {}
-        band = float(self.cfg.get("header_footer_band_ratio", 0.15))
-        hf_enabled = bool(self.cfg.get("header_footer_filter_enabled", True))
-        min_pages = int(self.cfg.get("header_footer_min_pages", 3))
+        # Non-negotiable: header/footer chrome always rejected
+        band = float(self.cfg.get("header_footer_band_ratio", 0.18))
+        hf_enabled = True
+        min_pages = int(self.cfg.get("header_footer_min_pages", 2))
 
         try:
             for page_num in range(len(pdf)):
                 page = pdf[page_num]
                 page_h = float(page.rect.height) or 1.0
+                page_w = float(page.rect.width) or 1.0
                 images = page.get_images(full=True)
                 for img_idx, img_info in enumerate(images):
                     try:
                         xref = img_info[0]
                         pix = fitz.Pixmap(pdf, xref)
-                        if pix.n > 4:
-                            pix = fitz.Pixmap(fitz.csRGB, pix)
-                        mode = "RGBA" if pix.n == 4 else "RGB"
-                        img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+                        img = pixmap_to_pil(pix)
 
-                        reason = self._skip_reason(img)
+                        page_display = page_num + 1
+                        h = _dhash(img)
+                        in_band = False
+                        bbox: dict[str, float] = {}
+                        try:
+                            rects = page.get_image_rects(xref)
+                            for r in rects:
+                                bbox = {
+                                    "x0": float(r.x0),
+                                    "y0": float(r.y0),
+                                    "x1": float(r.x1),
+                                    "y1": float(r.y1),
+                                }
+                                if r.y1 <= page_h * band or r.y0 >= page_h * (1.0 - band):
+                                    in_band = True
+                                    break
+                        except Exception:  # noqa: BLE001
+                            in_band = False
+
+                        reason = self._skip_reason(
+                            img,
+                            bbox=bbox,
+                            page_width=page_w,
+                            page_height=page_h,
+                        )
                         if reason == "blank":
                             skipped_blank += 1
                             continue
                         if reason == "brand":
                             skipped_brand += 1
                             continue
-
-                        page_display = page_num + 1
-                        h = _dhash(img)
-                        in_band = False
-                        try:
-                            rects = page.get_image_rects(xref)
-                            for r in rects:
-                                if r.y1 <= page_h * band or r.y0 >= page_h * (1.0 - band):
-                                    in_band = True
-                                    break
-                        except Exception:  # noqa: BLE001
-                            in_band = False
+                        if reason == "header_footer":
+                            skipped_hf += 1
+                            continue
 
                         hash_pages.setdefault(h, set()).add(page_display)
                         candidates.append(
@@ -302,6 +364,9 @@ class EnterpriseOKFIngestor:
                                 "img_idx": img_idx,
                                 "dhash": h,
                                 "in_band": in_band,
+                                "bbox": bbox,
+                                "page_w": page_w,
+                                "page_h": page_h,
                             }
                         )
                     except Exception as exc:  # noqa: BLE001
@@ -320,8 +385,8 @@ class EnterpriseOKFIngestor:
         for cand in candidates:
             hash_counts[cand["dhash"]] = hash_counts.get(cand["dhash"], 0) + 1
 
-        # Cross-page repeats (headers/footers) and any duplicate hash → never load
-        drop_dupes = bool(self.cfg.get("drop_duplicate_images", True))
+        # Cross-page repeats (headers/footers) and any duplicate hash → never upload
+        drop_dupes = True  # non-negotiable with HF policy
         repeat_hashes = {
             h
             for h, pages in hash_pages.items()
@@ -331,12 +396,30 @@ class EnterpriseOKFIngestor:
             h for h, count in hash_counts.items() if drop_dupes and count > 1
         }
         banned_hashes = repeat_hashes | duplicate_hashes
+        logger.info(
+            "Strict image filter %s: repeat_pages=%d duplicates=%d banned=%d",
+            pdf_name,
+            len(repeat_hashes),
+            len(duplicate_hashes),
+            len(banned_hashes),
+        )
 
-        # Pass 2: persist only unique, non-repeating content images
+        # Pass 2: persist only unique, non-repeating, non-chrome content images
         for cand in candidates:
             h = cand["dhash"]
-            if h in banned_hashes:
+            reason = self._skip_reason(
+                cand["img"],
+                bbox=cand.get("bbox") or {},
+                page_width=float(cand.get("page_w") or 0.0),
+                page_height=float(cand.get("page_h") or 0.0),
+                is_cross_page_repeat=h in repeat_hashes,
+                is_duplicate_hash=h in duplicate_hashes,
+            )
+            if reason == "header_footer" or h in banned_hashes:
                 skipped_hf += 1
+                continue
+            if reason in {"blank", "brand"}:
+                skipped_blank += 1
                 continue
 
             page_display = cand["page"]
@@ -541,7 +624,12 @@ class EnterpriseOKFIngestor:
         try:
             for page_idx in range(len(pdf)):
                 page_no = page_idx + 1
-                raw = (pdf[page_idx].get_text("text") or "").strip()
+                try:
+                    from app.rich_text import page_dict_to_markdown
+
+                    raw = (page_dict_to_markdown(pdf[page_idx]) or "").strip()
+                except Exception:  # noqa: BLE001
+                    raw = (pdf[page_idx].get_text("text") or "").strip()
                 if len(raw) < 3:
                     continue
                 # Split into paragraph-ish blocks, then pack into ~1500-char chunks

@@ -65,6 +65,219 @@ def extract_figure_refs(text: str) -> list[str]:
     return out
 
 
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "with",
+        "is",
+        "are",
+        "be",
+        "by",
+        "from",
+        "as",
+        "at",
+        "it",
+        "this",
+        "that",
+        "what",
+        "how",
+        "do",
+        "i",
+        "me",
+        "my",
+        "please",
+        "show",
+        "tell",
+        "explain",
+        "give",
+        "list",
+        "steps",
+        "step",
+        "procedure",
+    }
+)
+
+
+def query_keywords(query: str) -> list[str]:
+    toks = re.findall(r"[a-z0-9][a-z0-9_\-/']{1,}", (query or "").lower())
+    return [t for t in toks if t not in _STOPWORDS and len(t) > 1]
+
+
+def score_body_for_query(body: str, query: str) -> float:
+    """Higher = better topical match between query and passage."""
+    if not body:
+        return -1.0
+    text = body.lower()
+    score = 0.0
+    for fig in extract_figure_refs(query):
+        if re.search(rf"(?i)\bfig(?:ure)?\.?\s*{re.escape(fig)}\b", body):
+            score += 8.0
+    for kw in query_keywords(query):
+        # whole-word-ish count, capped
+        hits = len(re.findall(rf"(?i)\b{re.escape(kw)}\b", text))
+        if hits:
+            score += min(hits, 3) * (2.5 if len(kw) >= 5 else 1.2)
+    if re.search(r"(?i)steps?\s+to\s+follow", text):
+        score += 1.0
+    # Prefer passages that start near the ask (dispatch inbox etc.)
+    head = text[:400]
+    for kw in query_keywords(query)[:6]:
+        if re.search(rf"(?i)\b{re.escape(kw)}\b", head):
+            score += 1.5
+    return score
+
+
+def focus_body_on_query(body: str, query: str) -> str:
+    """
+    Crop a page body to the section that best answers the query.
+
+    Keeps STEPS / figure / keyword-aligned region so neighboring topics
+    from the same page (or chunk) are not dumped into the answer.
+    """
+    text = (body or "").strip()
+    if not text or not (query or "").strip():
+        return text
+
+    figs = extract_figure_refs(query)
+    kws = query_keywords(query)
+    candidates: list[int] = []
+    qlow = (query or "").lower()
+
+    for fig in figs:
+        for m in re.finditer(rf"(?i)\bfig(?:ure)?\.?\s*{re.escape(fig)}\b", text):
+            candidates.append(m.start())
+
+    # Prefer multi-word topic anchors (e.g. "copy and paste", "clipboard")
+    phrase_res: list[re.Pattern[str]] = []
+    if "copy" in kws and "paste" in kws:
+        phrase_res.append(re.compile(r"(?i)copy\s+and\s+paste|clipboard"))
+    if "drag" in kws and "drop" in kws:
+        phrase_res.append(re.compile(r"(?i)drag\s+and\s+drop"))
+    if "practical" in qlow and "activity" in qlow:
+        phrase_res.append(re.compile(r"(?i)practical\s+activity"))
+    for pre in phrase_res:
+        for m in pre.finditer(text):
+            candidates.append(m.start())
+
+    # If the query names a figure or phrase, prefer that over generic keyword hits
+    if not candidates:
+        for kw in kws:
+            for m in re.finditer(rf"(?i)\b{re.escape(kw)}\b", text):
+                candidates.append(m.start())
+                break  # first hit per keyword is enough
+    else:
+        pass
+
+    # Prefer a STEPS TO FOLLOW block near the best candidate (plain or markdown-wrapped)
+    _steps_re = re.compile(
+        r"(?im)^(?:\s*)(?:\*\*|__|<u>|<strong>|<em>)*\s*STEPS?\s+TO\s+FOLLOW\s*:?\s*(?:\*\*|__|</u>|</strong>|</em>)*\s*$"
+    )
+    steps_iter = list(_steps_re.finditer(text))
+    start = 0
+    if candidates:
+        anchor = min(candidates)
+        # Walk back to nearest STEPS heading before anchor, else paragraph start
+        chosen_steps = None
+        for sm in steps_iter:
+            if sm.start() <= anchor:
+                chosen_steps = sm
+            else:
+                break
+        if chosen_steps is not None:
+            start = chosen_steps.start()
+        else:
+            # paragraph / line start before anchor
+            nl = text.rfind("\n", 0, max(0, anchor - 1))
+            start = 0 if nl < 0 else nl + 1
+            # include a bit of lead-in (up to 1 prior short paragraph)
+            prev = text.rfind("\n\n", 0, start)
+            if prev >= 0 and start - prev < 280:
+                start = prev + 2
+    elif steps_iter:
+        # No keyword hits — take first STEPS block only (still better than whole page)
+        start = steps_iter[0].start()
+
+    cropped = text[start:].strip()
+
+    # Stop before the next unrelated STEPS block if present after some content
+    later_steps = list(_steps_re.finditer(cropped))
+    if len(later_steps) >= 2:
+        # Keep from first STEPS through just before the second STEPS
+        cropped = cropped[: later_steps[1].start()].strip()
+
+    # Drop running headers/footers noise
+    cropped = re.sub(r"(?im)^Ver\.?\s*\d+(?:\.\d+)?\s*\[[^\]]*\]\s*$", "", cropped)
+    cropped = re.sub(r"(?im)^\d{1,4}\s*$", "", cropped)
+    cropped = re.sub(r"\n{3,}", "\n\n", cropped).strip()
+
+    # If crop somehow emptied, fall back
+    return cropped or text
+
+
+def needs_continuation_page(body: str, query: str = "") -> bool:
+    """True when the focused excerpt likely continues on the next page."""
+    text = body or ""
+    if not text.strip():
+        return False
+    qlow = (query or "").lower()
+    # Practical activities / step lists often span two pages
+    if re.search(r"(?i)practical\s+activity", text):
+        step_nums = [int(n) for n in re.findall(r"(?im)^\s*(?:\*\*)?Step\s+(\d+)", text)]
+        if not step_nums or max(step_nums) <= 3:
+            return True
+    if re.search(r"(?i)as shown in\s+fig", text) and re.search(
+        r"(?im)^\s*(?:\*\*)?Step\s+\d+", text
+    ):
+        return True
+    # Copy/paste answers frequently continue with the practical activity on next page
+    if ("copy" in qlow and "paste" in qlow) or "clipboard" in qlow:
+        if re.search(r"(?i)practical\s+activity|step\s+\d+", text):
+            return True
+    return False
+
+
+def select_focused_hits(
+    hits: list[dict[str, Any]],
+    query: str,
+    *,
+    max_pages: int = 1,
+) -> list[dict[str, Any]]:
+    """Keep only the best-matching page(s) for a concise answer."""
+    if not hits:
+        return []
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for h in hits:
+        body = str(h.get("body") or "")
+        scored.append((score_body_for_query(body, query), h))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    best_score = scored[0][0]
+    # Always keep the top hit; add others only if close in score and different page
+    kept: list[dict[str, Any]] = []
+    seen_pages: set[int] = set()
+    for score, h in scored:
+        page = int(h.get("page") or 0)
+        if kept and score < best_score * 0.55 and score < best_score - 4:
+            break
+        if page in seen_pages:
+            continue
+        kept.append(h)
+        seen_pages.add(page)
+        if len(kept) >= max(1, max_pages):
+            break
+    # Preserve document order among the focused pages
+    kept.sort(key=lambda h: int(h.get("page") or 0))
+    return kept
+
+
 def _fig_sort_key(img: dict[str, Any]) -> tuple[int, str]:
     path = str(img.get("image_path") or "")
     m = re.search(r"fig(\d+)", path, re.I)
@@ -243,6 +456,7 @@ def build_interleaved_page(
     page_images: list[dict[str, Any]],
     *,
     max_images: int,
+    append_unused_images: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Rebuild one page: step text with figures inserted after mentioning steps."""
     images = sort_images_for_page(page_images)
@@ -259,7 +473,6 @@ def build_interleaved_page(
         refs = extract_figure_refs(block)
         # Drop standalone caption lines once we can render the real image
         if _caption_only.match(block.strip()) and images:
-            # still place matching images if not used
             for ref in refs:
                 if len(placed) >= max_images:
                     break
@@ -281,10 +494,17 @@ def build_interleaved_page(
             "",
             block,
         ).rstrip()
-        out_parts.append(cleaned if cleaned else block.rstrip())
+        # Also drop bare "Figure 413" lines that duplicate the image we insert
+        cleaned = re.sub(
+            r"(?im)(?:\n|^)\s*Fig(?:ure)?\.?\s*[\d.]+\s*$",
+            "",
+            cleaned,
+        ).rstrip()
+        if cleaned:
+            out_parts.append(cleaned)
         if not refs:
-            # If block mentions "fig" generically or is a step, attach next unused image
-            if images and re.search(r"(?i)\bfig(?:ure)?\b|\bstep\s+\d+", block):
+            # Only auto-attach next image when the block explicitly mentions a figure
+            if images and re.search(r"(?i)\bfig(?:ure)?\b", block):
                 refs = ["__next__"]
         for ref in refs:
             if len(placed) >= max_images:
@@ -309,17 +529,17 @@ def build_interleaved_page(
             out_parts.append(_markdown_image(img))
             out_parts.append("")
 
-    # Append any remaining same-page images not yet placed (cap)
-    for img in images:
-        if len(placed) >= max_images:
-            break
-        ip = str(img.get("image_path") or "")
-        if ip and ip not in used:
-            used.add(ip)
-            placed.append(img)
-            out_parts.append("")
-            out_parts.append(_markdown_image(img))
-            out_parts.append("")
+    if append_unused_images:
+        for img in images:
+            if len(placed) >= max_images:
+                break
+            ip = str(img.get("image_path") or "")
+            if ip and ip not in used:
+                used.add(ip)
+                placed.append(img)
+                out_parts.append("")
+                out_parts.append(_markdown_image(img))
+                out_parts.append("")
 
     return "\n".join(out_parts).strip(), placed
 
@@ -331,9 +551,8 @@ def build_faithful_answer(
     query: str = "",
 ) -> dict[str, Any] | None:
     """
-    Build a document-faithful interleaved answer when procedure evidence exists.
-
-    Returns None when the path should fall back to normal LLM answering.
+    Build a concise document-faithful interleaved answer for the best-matching
+    page/section only (avoids dumping neighboring out-of-context pages).
     """
     cfg = load_config()
     if not cfg.get("document_faithful_answers", True):
@@ -341,43 +560,101 @@ def build_faithful_answer(
     if not text_hits:
         return None
 
-    # Prefer hits that look like procedures
     procedural = [h for h in text_hits if looks_like_procedure(str(h.get("body") or ""))]
     if not procedural:
         if not query_wants_procedure(query):
             return None
         procedural = list(text_hits)
 
-    max_images = int(cfg.get("faithful_max_images", cfg.get("max_images_per_answer", 12)))
+    max_images = int(cfg.get("faithful_max_images", cfg.get("max_images_per_answer", 4)))
+    max_pages = int(cfg.get("faithful_max_pages", 1))
+    focused = select_focused_hits(procedural, query, max_pages=max_pages)
+    if not focused:
+        focused = procedural[:1]
+
     images = overlay_figure_labels_from_okf(images)
-    # Group images by page
     by_page: dict[int, list[dict[str, Any]]] = {}
     for img in images:
         page = int(img.get("page") or 0)
         by_page.setdefault(page, []).append(img)
 
-    # Deduplicate text bodies by content_hash / body while preserving page order
     seen_bodies: set[str] = set()
     ordered_pages: list[tuple[int, str, dict[str, Any]]] = []
-    for h in procedural:
+    for h in focused:
+        page = int(h.get("page") or 0)
+        source = str(h.get("source") or "")
         body = str(h.get("body") or "").strip()
+        # Prefer live PDF extraction so bold/italic/underline match the document
+        try:
+            from app.rich_text import extract_pdf_page_markdown
+
+            rich = extract_pdf_page_markdown(source, page)
+            if rich and len(rich.strip()) > 40:
+                body = rich
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("rich extract skipped: %s", exc)
         if not body:
             continue
+        body = focus_body_on_query(body, query)
+        try:
+            from app.rich_text import normalize_list_markers
+
+            body = normalize_list_markers(body)
+        except Exception:  # noqa: BLE001
+            pass
         key = str(h.get("content_hash") or "") or body[:200]
         if key in seen_bodies:
             continue
         seen_bodies.add(key)
-        page = int(h.get("page") or 0)
         ordered_pages.append((page, body, h))
+
+    # Contiguous continuation (e.g. Practical Activity spanning pp. 25–26)
+    cont_pages = int(cfg.get("faithful_continuation_pages", 1))
+    if ordered_pages and cont_pages > 0:
+        page0, body0, hit0 = ordered_pages[0]
+        source0 = str(hit0.get("source") or "")
+        have_pages = {p for p, _, _ in ordered_pages}
+        if needs_continuation_page(body0, query) and source0:
+            for offset in range(1, cont_pages + 1):
+                npage = page0 + offset
+                if npage in have_pages:
+                    continue
+                try:
+                    from app.rich_text import extract_pdf_page_markdown, normalize_list_markers
+
+                    nrich = extract_pdf_page_markdown(source0, npage)
+                except Exception:  # noqa: BLE001
+                    nrich = ""
+                if not nrich or len(nrich.strip()) < 40:
+                    break
+                nbody = focus_body_on_query(nrich, query)
+                # If focus emptied because keywords are only on prior page, keep
+                # continuation when Practical Activity / Step N continues.
+                if len((nbody or "").strip()) < 40:
+                    if re.search(r"(?i)practical\s+activity|^\s*(?:\*\*)?Step\s+\d+", nrich, re.M):
+                        nbody = nrich
+                    else:
+                        break
+                try:
+                    nbody = normalize_list_markers(nbody)
+                except Exception:  # noqa: BLE001
+                    pass
+                ordered_pages.append((npage, nbody, hit0))
+                have_pages.add(npage)
+                for img in load_okf_images_for_pages(source0, [npage]):
+                    by_page.setdefault(npage, []).append(img)
+                if not needs_continuation_page(nbody, query):
+                    break
 
     if not ordered_pages:
         return None
 
-    # Only reconstruct when at least one page is procedural or query asks for steps
     if not any(looks_like_procedure(b) for _, b, _ in ordered_pages) and not query_wants_procedure(
         query
     ):
-        return None
+        # Still allow focused factual excerpts that are the best hit
+        if score_body_for_query(ordered_pages[0][1], query) < 2.0:
+            return None
 
     sections: list[str] = []
     all_placed: list[dict[str, Any]] = []
@@ -385,14 +662,32 @@ def build_faithful_answer(
     citation_hit = ordered_pages[0][2]
 
     for page, body, hit in ordered_pages:
+        # Only images from this focused page (and matching figure labels when possible)
         page_imgs = by_page.get(page, [])
+        wanted = set(extract_figure_refs(query)) | set(extract_figure_refs(body))
+        if wanted:
+            filtered = []
+            for img in page_imgs:
+                label = str(img.get("figure_label") or "").strip()
+                if label and label in wanted:
+                    filtered.append(img)
+            # Keep page images if label filter emptied (labels may be missing)
+            page_imgs = filtered or page_imgs
+
         section, placed = build_interleaved_page(
-            body, page_imgs, max_images=max(0, max_images - len(all_placed))
+            body,
+            page_imgs,
+            max_images=max(0, max_images - len(all_placed)),
+            append_unused_images=False,
         )
         if not section:
             continue
-        header = f"**[{hit.get('source') or ''} page:{page}]**"
-        sections.append(f"{header}\n\n{section}")
+        # Concise: omit bulky page header when single-page focused answer
+        if len(ordered_pages) == 1:
+            sections.append(section)
+        else:
+            header = f"**[{hit.get('source') or ''} page:{page}]**"
+            sections.append(f"{header}\n\n{section}")
         all_placed.extend(placed)
         for block in split_procedure_blocks(body):
             steps_payload.append(

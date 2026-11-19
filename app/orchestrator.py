@@ -11,14 +11,22 @@ import ollama
 from app.cache_es import get_cached_answer, put_cached_answer
 from app.db.models import Conversation, Message
 from app.db.session import get_session, init_db
+from app.chat import AMBIGUITY_RULE, _detect_ambiguous_topics
 from app.faithful import (
     build_faithful_answer,
     load_okf_images_for_pages,
     looks_like_procedure,
     query_wants_procedure,
+    select_focused_hits,
 )
 from app.logger import get_logger
 from app.models_registry import get_model_registry
+from app.query_modes import (
+    detect_query_mode,
+    estimate_confidence,
+    mode_prompt_addendum,
+    suggested_questions,
+)
 from app.retrieval import (
     expand_contiguous_text,
     fetch_images_for_pages,
@@ -37,11 +45,15 @@ RULES:
 2. Preserve markdown tables EXACTLY.
 3. Every context passage is pre-tagged with its citation. Copy citation tags verbatim when used.
 4. RELATED IMAGES are evidence. Only reference an image when it belongs to the same source/page as used text. Include image_path as a markdown image. Never invent images.
-5. If evidence is insufficient, respond exactly: "Not found in approved OKF bundle"
-6. When a single passage directly answers, quote it fully.
-7. Conversation history is for reference resolution ONLY — facts must come from CONTEXT.
-8. Distinguish explicit document facts from visual interpretations marked as [VLM].
-9. If sources conflict, state the conflict with citations.
+5. Refuse with exactly "Not found in approved OKF bundle" ONLY when CONTEXT has no passage that supports the question. If CONTEXT describes the facts (even without using the question's wording), you MUST answer.
+6. For list / discuss / qualities / "remarkable" / "exceptional" questions: synthesize a clear structured answer (short intro + numbered points + brief conclusion) that is fully entailed by CONTEXT. Do not refuse merely because the document does not already print a numbered list.
+7. Prefer a ChatGPT-style grounded answer: organize facts from CONTEXT; quote sparingly; do not dump the entire passage unless the user asks for the exact text.
+8. Conversation history is for reference resolution ONLY — facts must come from CONTEXT.
+9. Distinguish explicit document facts from visual interpretations marked as [VLM].
+10. If sources conflict, state the conflict with citations.
+11. Bullet formatting: when the source uses checkbox/tick markers (, ✓, ✔, ☑, □, ■, or similar box/tick glyphs) at the start of list items, render each item as a solid round bullet using "• " (U+2022). Do not keep box or checkmark glyphs in the answer. Keep the item text unchanged.
+12. End with a short Reference line using the citation tags (source + page) from CONTEXT.
+{mode_addendum}
 {ambiguity_rule}
 
 CONTEXT:
@@ -49,6 +61,12 @@ CONTEXT:
 {images_context}
 {vlm_context}
 """
+
+
+_LIT_EXPAND_RE = re.compile(
+    r"(?i)\b(story|passage|qualities|exceptional|remarkable|discuss|list the|"
+    r"in the (?:story|passage|text)|astrologer|town hall)\b"
+)
 
 
 def format_citation(payload: dict[str, Any]) -> str:
@@ -136,29 +154,112 @@ def _vlm_interpret(images: list[dict[str, Any]], query: str, max_images: int) ->
     return "\nVLM INTERPRETATIONS:\n" + "\n\n".join(blocks) + "\n"
 
 
+_THINK_RE = re.compile(
+    r"(?is)<think>.*?</think>|<thinking>.*?</thinking>|^\s*Thinking:.*?(?=\n\n|\Z)"
+)
+_INCOMPLETE_END_RE = re.compile(
+    r"(?i)\b(a|an|the|by|to|of|for|with|and|or|into|from|that|which|who|whom|"
+    r"whose|when|where|while|because|as|but|than|then|this|these|those|its|"
+    r"his|her|their|our|my)\s*$"
+)
+
+
+def _strip_model_chrome(text: str) -> str:
+    """Remove reasoning wrappers some Ollama models emit before the real answer."""
+    cleaned = _THINK_RE.sub("", text or "")
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def _looks_incomplete(answer: str) -> bool:
+    """True when generation likely hit num_predict mid-sentence."""
+    text = (answer or "").strip()
+    if len(text) < 40:
+        return False
+    if text.endswith(("...", "…")):
+        return True
+    # Ends without sentence punctuation and looks cut off
+    if re.search(r"[.!?…\"”)]\s*$", text):
+        return False
+    if _INCOMPLETE_END_RE.search(text):
+        return True
+    # Trailing lowercase letter / open quote / dangling comma — usually truncated
+    if re.search(r"[,:;]\s*$", text):
+        return True
+    if re.search(r"[a-z0-9]\s*$", text) and not re.search(
+        r"(?i)\b(bundle|reference|sources?|citations?)\s*$", text
+    ):
+        return True
+    return False
+
+
+def _extract_chat_content(resp: Any) -> tuple[str, str]:
+    """Return (content, done_reason) from an Ollama chat response."""
+    done_reason = ""
+    if isinstance(resp, dict):
+        content = str(
+            (resp.get("message") or {}).get("content") or resp.get("response") or ""
+        )
+        done_reason = str(resp.get("done_reason") or resp.get("doneReason") or "")
+        return content.strip(), done_reason
+    msg = getattr(resp, "message", None)
+    content = str(
+        (getattr(msg, "content", None) if msg else None)
+        or getattr(resp, "response", None)
+        or ""
+    )
+    done_reason = str(getattr(resp, "done_reason", "") or "")
+    return content.strip(), done_reason
+
+
 def _chat(messages: list[dict[str, str]]) -> str:
     cfg = load_config()
     client = ollama.Client(host=cfg["ollama_url"])
+    num_predict = int(cfg.get("chat_num_predict", 2048))
     options = {
         "temperature": 0.1,
-        "num_ctx": int(cfg.get("chat_num_ctx", 4096)),
-        "num_predict": int(cfg.get("chat_num_predict", 512)),
+        "num_ctx": int(cfg.get("chat_num_ctx", 8192)),
+        "num_predict": num_predict,
     }
     for model in [cfg.get("chat_model"), cfg.get("chat_model_fallback")]:
         if not model:
             continue
         try:
             resp = client.chat(model=model, messages=messages, options=options)
-            if isinstance(resp, dict):
-                return str(
-                    (resp.get("message") or {}).get("content") or resp.get("response") or ""
-                ).strip()
-            msg = getattr(resp, "message", None)
-            return str(
-                (getattr(msg, "content", None) if msg else None)
-                or getattr(resp, "response", None)
-                or ""
-            ).strip()
+            content, done_reason = _extract_chat_content(resp)
+            answer = _strip_model_chrome(content)
+            # Continue once if Ollama stopped for length / mid-sentence cut-off
+            if answer and (
+                done_reason == "length" or _looks_incomplete(answer)
+            ):
+                cont_msgs = list(messages) + [
+                    {"role": "assistant", "content": answer},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous answer was cut off mid-sentence. "
+                            "Continue exactly from where you stopped. Do not "
+                            "repeat earlier sentences; finish the full answer "
+                            "with conclusion and Reference."
+                        ),
+                    },
+                ]
+                cont_opts = dict(options)
+                cont_opts["num_predict"] = max(num_predict, 1024)
+                try:
+                    cont_resp = client.chat(
+                        model=model, messages=cont_msgs, options=cont_opts
+                    )
+                    cont_text, _ = _extract_chat_content(cont_resp)
+                    cont_text = _strip_model_chrome(cont_text)
+                    if cont_text:
+                        # If model restarted instead of continuing, prefer longer complete text
+                        if cont_text.startswith(answer[:80]):
+                            answer = cont_text
+                        else:
+                            answer = (answer.rstrip() + " " + cont_text.lstrip()).strip()
+                except Exception as cont_exc:  # noqa: BLE001
+                    logger.warning("Answer continuation failed for %s: %s", model, cont_exc)
+            return answer
         except Exception as exc:  # noqa: BLE001
             logger.warning("Chat model %s failed: %s", model, exc)
     return (
@@ -224,36 +325,61 @@ def rag_answer(
     conversation_id: str | None = None,
     user_id: str = "anonymous",
     access_scopes: list[str] | None = None,
+    mode: str | None = None,
+    skip_cache: bool = False,
 ) -> dict[str, Any]:
     init_db()
-    cached = get_cached_answer(query, history)
-    if cached is not None:
-        return cached
+    if not skip_cache:
+        cached = get_cached_answer(query, history)
+        if cached is not None:
+            return cached
 
     cfg = load_config()
     max_chars = int(cfg.get("max_context_chars", 24000))
     max_images = int(cfg.get("max_images_per_answer", 4))
     history_turns = int(cfg.get("chat_history_turns", 6))
     faithful_max = int(cfg.get("faithful_max_images", 12))
+    mode_detect = bool(cfg.get("query_mode_detection", True))
+    force_mode = mode if mode in {"qa", "mcq", "summary", "procedure"} else None
+    query_mode = detect_query_mode(query, force=force_mode if mode_detect else "qa")  # type: ignore[arg-type]
 
     retrieved = hybrid_retrieve(
         query, top_k=top_k, history=history, access_scopes=access_scopes
     )
-    text_hits = prefer_pipeline_chunks(heuristic_rerank(retrieved["text_hits"]))
+    text_hits = prefer_pipeline_chunks(
+        heuristic_rerank(
+            retrieved["text_hits"],
+            query=str(retrieved.get("search_query") or query or ""),
+        )
+    )
 
     best_source = str(text_hits[0].get("source") or "") if text_hits else ""
     allowed_sources = {best_source} if best_source else set()
 
-    # Expand contiguous pages for document-faithful assembly
-    use_faithful = bool(cfg.get("document_faithful_answers", True)) and bool(text_hits)
+    # Focused faithful assembly: best page only (optional small window)
+    use_faithful = (
+        bool(cfg.get("document_faithful_answers", True))
+        and bool(text_hits)
+        and query_mode in {"procedure", "qa"}
+    )
     if use_faithful:
-        text_hits = expand_contiguous_text(text_hits)
+        win = int(cfg.get("faithful_page_window", 0))
+        max_pages = int(cfg.get("faithful_max_pages", 1))
+        # Literature / list-discuss questions often span a page break (name on p16,
+        # qualities on p17) — widen the focus window so CONTEXT is complete.
+        if query_mode == "qa" and _LIT_EXPAND_RE.search(query or ""):
+            win = max(win, 1)
+            max_pages = max(max_pages, 2)
+        # Score-focus first so neighboring Advanced Search pages are not pulled in
+        text_hits = select_focused_hits(text_hits, query, max_pages=max(1, max_pages))
+        if win > 0:
+            text_hits = expand_contiguous_text(text_hits, window=win)
+            text_hits = select_focused_hits(text_hits, query, max_pages=max(1, max_pages))
         pages = sorted({int(h.get("page") or 0) for h in text_hits if int(h.get("page") or 0) > 0})
         images = fetch_images_for_pages(best_source, pages, limit=faithful_max)
         if not images:
             images = load_okf_images_for_pages(best_source, pages)
-        elif len(images) < 2:
-            # Merge any OKF figures Milvus missed (e.g. mid-reindex)
+        else:
             seen = {str(i.get("image_path") or "") for i in images}
             for extra in load_okf_images_for_pages(best_source, pages):
                 ip = str(extra.get("image_path") or "")
@@ -283,14 +409,21 @@ def rag_answer(
 
     # Prefer reconstruction for procedures
     faithful = None
-    if use_faithful:
+    if use_faithful and query_mode == "procedure":
+        procedural_evidence = any(
+            looks_like_procedure(str(h.get("body") or "")) for h in text_hits
+        ) or query_wants_procedure(query)
+        if procedural_evidence:
+            faithful = build_faithful_answer(text_hits, images, query=query)
+    elif use_faithful and query_mode == "qa":
+        # Keep prior behavior: faithful when procedural evidence exists
         procedural_evidence = any(
             looks_like_procedure(str(h.get("body") or "")) for h in text_hits
         ) or query_wants_procedure(query)
         if procedural_evidence:
             faithful = build_faithful_answer(text_hits, images, query=query)
 
-    mode = "llm"
+    answer_mode = "llm"
     steps: list[dict[str, Any]] = []
     images_interleaved = False
 
@@ -298,8 +431,9 @@ def rag_answer(
         answer = str(faithful["answer"])
         images = list(faithful.get("images") or images)
         steps = list(faithful.get("steps") or [])
-        mode = "document_faithful"
+        answer_mode = "document_faithful"
         images_interleaved = True
+        query_mode = "procedure"
     else:
         context = _build_context(text_hits, max_chars)
         images_context = _build_images_context(images[:max_images])
@@ -308,8 +442,22 @@ def rag_answer(
             images, query, int(cfg.get("answer_vlm_max_images", 2))
         )
 
+        ambiguity_rule = ""
+        threshold = float(cfg.get("ambiguity_score_gap_threshold", 0.03))
+        if query_mode == "qa" and text_hits:
+            candidates = _detect_ambiguous_topics(text_hits, threshold)
+            if candidates:
+                lines = "\n".join(
+                    f"- {c.get('source') or ''}: {c.get('title') or ''}" for c in candidates
+                )
+                ambiguity_rule = AMBIGUITY_RULE.format(candidates=lines)
+
+        addendum = mode_prompt_addendum(query_mode)  # type: ignore[arg-type]
+        mode_block = f"\n{addendum}\n" if addendum else ""
+
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-            ambiguity_rule="",
+            mode_addendum=mode_block,
+            ambiguity_rule=ambiguity_rule,
             context=context or "(no matching passages)",
             images_context=images_context,
             vlm_context=vlm_context,
@@ -323,15 +471,59 @@ def rag_answer(
         messages.append({"role": "user", "content": query})
 
         answer = _chat(messages)
-        if text_hits and "not found in approved okf bundle" not in answer.lower():
+        answer_mode = query_mode
+        # Local models sometimes refuse even when CONTEXT clearly supports a
+        # list/discuss question — one grounded retry with an explicit synthesis ask.
+        if (
+            text_hits
+            and query_mode == "qa"
+            and "not found in approved okf bundle" in (answer or "").lower()
+            and _LIT_EXPAND_RE.search(query or "")
+        ):
+            retry_messages = list(messages) + [
+                {
+                    "role": "user",
+                    "content": (
+                        "CONTEXT does support this question. Using only CONTEXT, write a "
+                        "structured answer with a short intro, numbered exceptional "
+                        "qualities/facts, a one-line conclusion, and a Reference citation. "
+                        "Do not answer Not found."
+                    ),
+                }
+            ]
+            retry = _chat(retry_messages)
+            if retry and "not found in approved okf bundle" not in retry.lower():
+                answer = retry
+        append_exact = bool(cfg.get("append_exact_source_excerpt", False))
+        if (
+            append_exact
+            and text_hits
+            and "not found in approved okf bundle" not in answer.lower()
+            and query_mode != "summary"
+            and "clarifying" not in answer.lower()
+            and not answer.strip().endswith("?")
+        ):
             best = text_hits[0]
             answer = (
                 f"{answer}\n\n---\n**Exact source text** [{format_citation(best)}]:\n\n"
                 f"{str(best.get('body') or '')}"
             )
 
+    try:
+        from app.rich_text import normalize_list_markers
+
+        answer = normalize_list_markers(answer)
+    except Exception:  # noqa: BLE001
+        pass
+
     warnings = _validate_citations(answer, text_hits, images)
     evidence_map = _build_evidence_map(text_hits, images)
+    confidence = estimate_confidence(
+        answer=answer, text_hits=text_hits, warnings=warnings, mode=answer_mode
+    )
+    suggestions = suggested_questions(
+        query, text_hits, mode=query_mode, limit=4
+    )
 
     result = {
         "answer": answer,
@@ -343,7 +535,10 @@ def rag_answer(
         "images": images,
         "evidence_map": evidence_map,
         "steps": steps,
-        "mode": mode,
+        "mode": answer_mode,
+        "query_mode": query_mode,
+        "confidence": confidence,
+        "suggested_questions": suggestions,
         "images_interleaved": images_interleaved,
         "intent": retrieved.get("intent"),
         "warnings": warnings,
@@ -374,14 +569,31 @@ def rag_answer(
                             {"image_path": i.get("image_path"), "page": i.get("page")}
                             for i in images
                         ],
-                        "mode": mode,
+                        "mode": answer_mode,
+                        "query_mode": query_mode,
+                        "confidence": confidence,
+                        "suggested_questions": suggestions,
                         "steps": steps,
                     },
                 )
             )
             result["conversation_id"] = conv.id
+            # Expose last assistant message id for feedback
+            result["message_id"] = None
+            try:
+                last = (
+                    session.query(Message)
+                    .filter_by(conversation_id=conv.id, role="assistant")
+                    .order_by(Message.created_at.desc())
+                    .first()
+                )
+                if last:
+                    result["message_id"] = last.id
+            except Exception:  # noqa: BLE001
+                pass
     except Exception as exc:  # noqa: BLE001
         logger.warning("Conversation persist failed: %s", exc)
 
-    put_cached_answer(query, result, history)
+    if not skip_cache:
+        put_cached_answer(query, result, history)
     return result

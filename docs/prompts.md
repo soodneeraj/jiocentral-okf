@@ -19,4 +19,4 @@ From `app/orchestrator.py::_vlm_interpret`:
 
 ## Grounded answer generation
 
-System prompt in `app/orchestrator.py::SYSTEM_PROMPT_TEMPLATE` — evidence-only answers, citation tags, image path rules, insufficient-evidence refusal line, conflict disclosure, VLM interpretation marked `[VLM]`.
+System prompt in `app/orchestrator.py::SYSTEM_PROMPT_TEMPLATE` — evidence-only answers, citation tags, image path rules, insufficient-evidence refusal line, conflict disclosure, VLM interpretation marked `[VLM]`, and convert source checkbox/tick list markers (``, `✓`, etc.) to solid round bullets (`•`).

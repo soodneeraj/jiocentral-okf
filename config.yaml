@@ -19,26 +19,36 @@ vision_model: gemma4:12b
 # Vision captioning is slow/fragile on large PDF corpora; keep false for fast Milvus load
 caption_images: false
 top_k: 5
-chat_num_ctx: 4096
-chat_num_predict: 512
+# Larger context + generation budget so essay/list answers are not cut mid-sentence
+chat_num_ctx: 8192
+chat_num_predict: 2048
 
 okf_bundle_dir: okf-bundle
 source_pdfs_dir: source_pdfs
 
 brand_image_filter_enabled: true
 brand_image_max_hamming: 10
+# Strict: never ingest blank / near-empty image XObjects
 low_info_filter_enabled: true
-low_info_max_std: 4.0
-# Drop images that repeat across many pages (headers/footers/watermarks)
+low_info_max_std: 5.0
+# NON-NEGOTIABLE image chrome policy (enforced in code even if flipped false here):
+# - common headers/footers/watermarks are never extracted into OKF
+# - cross-page repeats and duplicate hashes are never uploaded
+# - decorative margin strips / HF-band banners are rejected
 header_footer_filter_enabled: true
 header_footer_min_pages: 2
-header_footer_band_ratio: 0.15
-# If the same image hash appears more than once in a PDF, load NONE of those copies
+header_footer_band_ratio: 0.18
 drop_duplicate_images: true
 delete_duplicate_image_files: true
+index_header_footer_images: false
+# Skip full-page renders when the page has no real content
+skip_blank_page_renders: true
 
 chat_history_turns: 6
 ambiguity_score_gap_threshold: 0.03
+# Phase 1 MVP: auto-detect qa | mcq | summary | procedure
+query_mode_detection: true
+answer_actions_enabled: true
 
 # Elasticsearch Q&A response cache (1 hour TTL)
 elasticsearch_url: https://localhost:9200
@@ -60,12 +70,8 @@ ocr_enabled: true
 ocr_min_confidence: 0.4
 classify_empty_text_threshold: 40
 
-# Asset registry — store once, keep all occurrences (master prompt policy)
+# Asset registry — store unique content binaries once (repeats still never uploaded)
 reuse_duplicate_image_binaries: true
-# Legacy drop-all policy is OFF; occurrences retained
-drop_duplicate_images: false
-delete_duplicate_image_files: false
-index_header_footer_images: false
 
 # Hybrid retrieval
 enable_image_search: true
@@ -74,6 +80,8 @@ hybrid_image_weight: 0.4
 rrf_k: 60
 rerank_model: ""
 rerank_provider: heuristic
+# Over-fetch dense hits before lexical/heuristic rerank (exercise pages often outrank facts)
+retrieval_overfetch_factor: 4
 max_context_chars: 24000
 page_expansion_limit: 2
 query_intent_enabled: true
@@ -84,8 +92,14 @@ answer_vlm_max_images: 2
 
 # Document-faithful procedure answers (ordered steps + interleaved images)
 document_faithful_answers: true
-faithful_page_window: 1
-faithful_max_images: 12
+# 0 = default; literature/list-discuss QA auto-widens to ±1 in orchestrator
+faithful_page_window: 0
+# When true, append raw source dump under the answer (ChatGPT-style answers keep this false)
+append_exact_source_excerpt: false
+faithful_max_pages: 1
+# Append next page(s) only when a Practical Activity / step list clearly continues
+faithful_continuation_pages: 1
+faithful_max_images: 6
 
 # Security (Phase 8)
 auth_enabled: false

@@ -203,3 +203,18 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+
+
+class AnswerFeedback(Base):
+    """Thumbs up/down feedback on assistant answers (Phase 1 MVP)."""
+
+    __tablename__ = "answer_feedback"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    conversation_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    message_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    user_id: Mapped[str] = mapped_column(String(128), default="anonymous", index=True)
+    query: Mapped[str] = mapped_column(Text, default="")
+    rating: Mapped[str] = mapped_column(String(8), nullable=False)  # up | down
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

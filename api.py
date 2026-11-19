@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from app.admin import (
     get_job_status,
     list_source_pdfs,
+    purge_source_pdf,
     save_uploaded_pdfs,
     start_pipeline,
 )
@@ -64,6 +65,25 @@ class ChatRequest(BaseModel):
     top_k: int = 10
     history: list[HistoryMessage] = Field(default_factory=list)
     conversation_id: str | None = None
+    mode: str | None = None
+
+
+class TransformRequest(BaseModel):
+    action: str
+    query: str
+    answer: str = ""
+    excerpts: str = ""
+    conversation_id: str | None = None
+    history: list[HistoryMessage] = Field(default_factory=list)
+    top_k: int = 10
+
+
+class FeedbackRequest(BaseModel):
+    rating: str
+    conversation_id: str | None = None
+    message_id: str | None = None
+    query: str = ""
+    note: str = ""
 
 
 class ProcessRequest(BaseModel):
@@ -159,6 +179,42 @@ def chat(req: ChatRequest) -> dict[str, Any]:
         top_k=req.top_k,
         history=history,
         conversation_id=req.conversation_id,
+        mode=req.mode,
+    )
+
+
+@app.post("/chat/transform")
+def chat_transform(req: TransformRequest) -> dict[str, Any]:
+    from app.answer_actions import transform_answer
+
+    action = (req.action or "").strip().lower()
+    if action not in {"regenerate", "shorter", "detailed", "simpler"}:
+        raise HTTPException(status_code=400, detail="Invalid action")
+    history = [{"role": m.role, "content": m.content} for m in req.history] or None
+    return transform_answer(
+        action=action,  # type: ignore[arg-type]
+        query=req.query,
+        answer=req.answer,
+        excerpts=req.excerpts,
+        history=history,
+        conversation_id=req.conversation_id,
+        top_k=req.top_k,
+    )
+
+
+@app.post("/chat/feedback")
+def chat_feedback(req: FeedbackRequest) -> dict[str, Any]:
+    from app.answer_actions import save_feedback
+
+    rating = (req.rating or "").strip().lower()
+    if rating not in {"up", "down"}:
+        raise HTTPException(status_code=400, detail="rating must be up or down")
+    return save_feedback(
+        rating=rating,  # type: ignore[arg-type]
+        conversation_id=req.conversation_id,
+        message_id=req.message_id,
+        query=req.query,
+        note=req.note,
     )
 
 
@@ -207,6 +263,15 @@ def admin_page() -> str:
 @app.get("/admin/pdfs")
 def admin_list_pdfs() -> dict[str, Any]:
     return {"pdfs": list_source_pdfs()}
+
+
+@app.delete("/admin/pdfs/{filename:path}")
+def admin_delete_pdf(filename: str) -> dict[str, Any]:
+    """Delete a source PDF and purge all persistent references."""
+    result = purge_source_pdf(filename)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("detail") or "Delete failed")
+    return result
 
 
 @app.get("/admin/status")

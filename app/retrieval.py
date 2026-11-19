@@ -91,13 +91,39 @@ def classify_intent(query: str) -> QueryIntent:
     return QueryIntent.TEXT
 
 
+def normalize_search_query(query: str) -> str:
+    """Strip textbook pedagogy so dense search hits narrative facts, not the exercise stem."""
+    q = (query or "").strip()
+    if not q:
+        return q
+    q = re.sub(
+        r"(?i)^in the story(?:\s+we are told that)?\s*",
+        "",
+        q,
+    )
+    q = re.sub(
+        r"(?i)\bdiscuss(?:\s+it)?\s+in\s+(?:a\s+)?group\b[.,;:]?\s*",
+        "",
+        q,
+    )
+    q = re.sub(
+        r"(?i)\b(?:answer the following|write a short note on|explain with reference "
+        r"to the context|complete the following)\b[.,;:]?\s*",
+        "",
+        q,
+    )
+    q = re.sub(r"\s+", " ", q).strip()
+    return q or query.strip()
+
+
 def rewrite_query(query: str, history: list[dict[str, str]] | None = None) -> str:
+    q = normalize_search_query(query)
     if not history:
-        return query
+        return q
     # Resolve simple follow-ups
     follow = re.search(
         r"\b(it|that|this|the (?:second|first|previous|above) (?:one|component|diagram|figure))\b",
-        query,
+        q,
         re.I,
     )
     prior_user = ""
@@ -110,10 +136,10 @@ def rewrite_query(query: str, history: list[dict[str, str]] | None = None) -> st
         if prior_user and prior_assistant:
             break
     if follow and prior_user:
-        return f"{prior_user}\nFollow-up: {query}"
-    if prior_user and len(query.split()) <= 8:
-        return f"{prior_user} {query}"
-    return query
+        return f"{normalize_search_query(prior_user)}\nFollow-up: {q}"
+    if prior_user and len(q.split()) <= 8:
+        return f"{normalize_search_query(prior_user)} {q}"
+    return q
 
 
 def _search_collection(
@@ -192,7 +218,10 @@ def hybrid_retrieve(
         f"Represent this sentence for searching relevant passages: {search_q}"
     )
     filt = _access_filter(access_scopes)
-    text_top = top_k if intent != QueryIntent.IMAGE else max(3, top_k // 2)
+    # Over-fetch text so lexical/heuristic rerank can recover factual needles
+    # that dense retrieval buries under exercise/worksheet pages.
+    fetch_mult = max(2, int(cfg.get("retrieval_overfetch_factor", 4)))
+    text_top = (top_k if intent != QueryIntent.IMAGE else max(3, top_k // 2)) * fetch_mult
     image_top = top_k if intent in {QueryIntent.IMAGE, QueryIntent.DIAGRAM, QueryIntent.MIXED} else max(3, top_k // 2)
 
     text_hits = _search_collection(
@@ -202,6 +231,7 @@ def hybrid_retrieve(
         output_fields=TEXT_FIELDS,
         filt=filt,
     )
+    text_hits = heuristic_rerank(text_hits, query=search_q)[: max(top_k, text_top // fetch_mult)]
     image_hits: list[dict[str, Any]] = []
     if cfg.get("enable_image_search", True):
         image_hits = _search_collection(
@@ -285,14 +315,113 @@ def _expand_page_images(text_hits: list[dict[str, Any]], cfg: dict[str, Any]) ->
     return collected
 
 
-def heuristic_rerank(text_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    def key(h: dict[str, Any]) -> tuple[int, int, float]:
-        is_table = 0 if str(h.get("type") or "") == "table" else 1
-        body = str(h.get("body") or "")
-        low = 1 if len(body) < 300 and body.endswith("?") else 0
-        return (is_table, low, -float(h.get("distance") or 0))
+_EXERCISE_MARKERS = (
+    "brainstorming",
+    "ice breakers",
+    "ice breaker",
+    "(a1)",
+    "(a2)",
+    "(a3)",
+    "(a4)",
+    "complete the activity",
+    "discuss with your partner",
+    "choose the correct",
+    "multiple choice",
+    "fill in the blanks",
+    "match the following",
+    "guess the meaning",
+)
 
-    return sorted(text_hits, key=key)
+
+_QUERY_STOP = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "did",
+        "do",
+        "does",
+        "how",
+        "much",
+        "many",
+        "what",
+        "when",
+        "where",
+        "who",
+        "why",
+        "which",
+        "of",
+        "to",
+        "for",
+        "in",
+        "on",
+        "per",
+        "and",
+        "or",
+        "with",
+        "from",
+        "about",
+        "this",
+        "that",
+        "it",
+    }
+)
+
+
+def _query_content_terms(query: str) -> list[str]:
+    toks = re.findall(r"[a-z0-9']+", (query or "").lower())
+    return [t for t in toks if t not in _QUERY_STOP and len(t) > 2]
+
+
+def _looks_like_exercise(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _EXERCISE_MARKERS)
+
+
+def heuristic_rerank(
+    text_hits: list[dict[str, Any]],
+    *,
+    query: str = "",
+) -> list[dict[str, Any]]:
+    """
+    Rerank dense hits with light lexical signals.
+
+    Dense retrieval often prefers worksheet/exercise pages that mention the same
+    entity (e.g. \"astrologer\") over the narrative sentence that holds the fact.
+    Boost chunks that contain distinctive query terms; demote exercise chrome.
+    """
+    terms = _query_content_terms(query)
+
+    def score(h: dict[str, Any]) -> tuple:
+        body = str(h.get("body") or "")
+        title = str(h.get("title") or "")
+        blob = f"{title}\n{body}".lower()
+        is_table = 0 if str(h.get("type") or "") == "table" else 1
+        exercise = 1 if _looks_like_exercise(blob) else 0
+        low_info = 1 if len(body.strip()) < 300 and body.strip().endswith("?") else 0
+        # Lexical overlap: rare/long terms weigh more
+        lex = 0.0
+        for t in terms:
+            if t in blob:
+                lex += 2.5 if len(t) >= 5 else 1.0
+                # Extra boost when term appears near money/quantity cues
+                if t in {"charge", "charged", "pies", "anna", "rupees", "cost", "price", "fee"}:
+                    lex += 3.0
+        # Prefer chunks that contain >=2 query terms
+        hits_n = sum(1 for t in terms if t in blob)
+        if hits_n >= 2:
+            lex += 2.0
+        if hits_n >= 3:
+            lex += 2.0
+        dist = float(h.get("distance") or 0.0)
+        # Sort: tables first, non-exercise, non-low-info, higher lex, higher distance (IP)
+        return (is_table, exercise, low_info, -lex, -dist)
+
+    return sorted(text_hits, key=score)
 
 
 def _is_pipeline_chunk(hit: dict[str, Any]) -> bool:

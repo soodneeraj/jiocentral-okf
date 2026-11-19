@@ -10,7 +10,8 @@ from typing import Any
 import yaml
 from PIL import Image
 
-from app.assets import register_image
+from app.assets import pixmap_to_pil, register_image
+from app.image_chrome import chrome_skip_reason
 from app.chunking import associate_images_to_chunks, chunk_table_markdown, link_chunks, pack_paragraphs
 from app.classification import (
     DocumentType,
@@ -55,13 +56,39 @@ def _render_okf(meta: dict[str, Any], body: str) -> str:
     return f"---\n{fm}\n---\n\n{body.strip()}\n"
 
 
-def _grayscale_std(img: Image.Image) -> float:
+def _grayscale_stats(img: Image.Image) -> tuple[float, float]:
     gray = img.convert("L")
     pixels = list(gray.getdata())
     if not pixels:
-        return 0.0
+        return 0.0, 0.0
     mean = sum(pixels) / len(pixels)
-    return (sum((p - mean) ** 2 for p in pixels) / len(pixels)) ** 0.5
+    std = (sum((p - mean) ** 2 for p in pixels) / len(pixels)) ** 0.5
+    return mean, std
+
+
+def _grayscale_std(img: Image.Image) -> float:
+    return _grayscale_stats(img)[1]
+
+
+def is_blank_image(img: Image.Image, *, max_std: float = 5.0) -> bool:
+    """True for empty/near-empty XObjects (blank plates, rules, spacer pixels)."""
+    if img is None:
+        return True
+    w, h = img.size
+    if w < 24 or h < 24:
+        return True
+    mean, std = _grayscale_stats(img)
+    if std < max_std:
+        return True
+    if mean >= 250.0 or mean <= 5.0:
+        return True
+    # Almost entirely white page plate
+    gray = img.convert("L")
+    pixels = list(gray.getdata())
+    near_white = sum(1 for p in pixels if p >= 248) / max(1, len(pixels))
+    if near_white >= 0.985:
+        return True
+    return False
 
 
 def _dhash(img: Image.Image) -> int:
@@ -102,9 +129,32 @@ class PageAwareIngestor:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Reference image load failed %s: %s", path, exc)
 
-    def _skip_reason(self, img: Image.Image) -> str | None:
+    def _skip_reason(
+        self,
+        img: Image.Image,
+        *,
+        bbox: dict[str, Any] | None = None,
+        page_width: float = 0.0,
+        page_height: float = 0.0,
+        is_cross_page_repeat: bool = False,
+        is_duplicate_hash: bool = False,
+    ) -> str | None:
+        # Non-negotiable: headers/footers/decorative chrome never enter OKF
+        band = float(self.cfg.get("header_footer_band_ratio", 0.18))
+        chrome = chrome_skip_reason(
+            img,
+            bbox=bbox,
+            page_width=page_width,
+            page_height=page_height,
+            band_ratio=max(0.12, band),
+            is_cross_page_repeat=is_cross_page_repeat,
+            is_duplicate_hash=is_duplicate_hash,
+        )
+        if chrome:
+            return chrome
         if self.cfg.get("low_info_filter_enabled", True):
-            if _grayscale_std(img) < float(self.cfg.get("low_info_max_std", 4.0)):
+            max_std = float(self.cfg.get("low_info_max_std", 5.0))
+            if is_blank_image(img, max_std=max_std):
                 return "blank"
         if self.cfg.get("brand_image_filter_enabled", True) and self._reference_hashes:
             max_ham = int(self.cfg.get("brand_image_max_hamming", 10))
@@ -203,13 +253,17 @@ class PageAwareIngestor:
 
                 document.document_type = classify_document(page_types).value
 
-                band = float(self.cfg.get("header_footer_band_ratio", 0.15))
-                hf_enabled = bool(self.cfg.get("header_footer_filter_enabled", True))
+                # Non-negotiable: HF/chrome filters are always enforced
+                band = float(self.cfg.get("header_footer_band_ratio", 0.18))
+                hf_enabled = True
                 min_pages = int(self.cfg.get("header_footer_min_pages", 2))
-                index_hf = bool(self.cfg.get("index_header_footer_images", False))
+                index_hf = False
+                drop_dupes = True
+                skip_blank_renders = bool(self.cfg.get("skip_blank_page_renders", True))
 
-                # Collect all images first for cross-page HF
+                # Collect all images first for cross-page HF / duplicate detection
                 candidates_by_page: dict[int, list[dict[str, Any]]] = {}
+                hash_counts: dict[str, int] = {}
                 for idx in range(page_count):
                     page = pdf[idx]
                     page_no = idx + 1
@@ -219,10 +273,7 @@ class PageAwareIngestor:
                         try:
                             xref = img_info[0]
                             pix = fitz.Pixmap(pdf, xref)
-                            if pix.n > 4:
-                                pix = fitz.Pixmap(fitz.csRGB, pix)
-                            mode = "RGBA" if pix.n == 4 else "RGB"
-                            img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+                            img = pixmap_to_pil(pix)
                             reason = self._skip_reason(img)
                             if reason in {"blank", "brand"}:
                                 continue
@@ -244,6 +295,7 @@ class PageAwareIngestor:
                                 pass
                             ph = f"{_dhash(img):016x}"
                             hash_pages.setdefault(ph, set()).add(page_no)
+                            hash_counts[ph] = hash_counts.get(ph, 0) + 1
                             cands.append(
                                 {
                                     "img": img,
@@ -263,11 +315,24 @@ class PageAwareIngestor:
                             )
                     candidates_by_page[page_no] = cands
 
+                # Strict: repeated across pages ⇒ header/footer/watermark — never upload
                 hf_hashes = {
                     h
                     for h, pages in hash_pages.items()
                     if hf_enabled and len(pages) >= min_pages
                 }
+                # Strict: any duplicate hash in the PDF ⇒ upload none of those copies
+                dup_hashes = {
+                    h for h, count in hash_counts.items() if drop_dupes and count > 1
+                }
+                banned_hashes = hf_hashes | dup_hashes
+                logger.info(
+                    "Image ban list for %s: repeated_pages=%d duplicates=%d total_banned=%d",
+                    pdf_name,
+                    len(hf_hashes),
+                    len(dup_hashes),
+                    len(banned_hashes),
+                )
 
                 all_chunk_ids: list[str] = []
 
@@ -279,7 +344,13 @@ class PageAwareIngestor:
                     content_count = 0
                     errors: list[str] = []
                     try:
-                        text = (page.get_text("text") or "").strip()
+                        # Prefer formatting-preserving extract (bold/italic/underline)
+                        try:
+                            from app.rich_text import page_dict_to_markdown
+
+                            text = (page_dict_to_markdown(page) or "").strip()
+                        except Exception:  # noqa: BLE001
+                            text = (page.get_text("text") or "").strip()
                         chunks_for_page = []
 
                         # Text extraction
@@ -307,60 +378,87 @@ class PageAwareIngestor:
 
                         # OCR / page render for scanned or image-only
                         ocr_text = ""
+                        page_cands = candidates_by_page.get(page_no, [])
+                        page_has_objects = bool(page_cands) or bool((text or "").strip())
                         if ptype in {PageType.SCANNED, PageType.IMAGE, PageType.EMPTY} or (
                             ptype == PageType.TEXT_IMAGE and len(text) < 40
                         ):
                             try:
                                 rendered = self._render_page(page)
-                                ocr = ocr_page_image(rendered)
-                                ocr_text = ocr.text
-                                if ocr_text:
-                                    ocr_chunks = pack_paragraphs(
-                                        [ocr_text],
-                                        page_number=page_no,
-                                        section_heading="OCR",
-                                        chunk_type="ocr",
-                                        max_chars=2000,
-                                    )
-                                    chunks_for_page.extend(ocr_chunks)
-                                    # Also keep full-page image as asset
-                                    asset, occ, _ = register_image(
-                                        session,
-                                        image=rendered,
-                                        document_id=document.id,
-                                        page_number=page_no,
-                                        image_role="page_scan",
-                                        indexable=True,
-                                        caption=f"Page {page_no} scan",
-                                        ocr_text=ocr_text,
-                                    )
-                                    page_image_occ_ids.setdefault(page_no, []).append(occ.id)
-                                    content_count += 1
-                                    update_page(
-                                        session,
-                                        document.id,
-                                        page_no,
-                                        ocr_status="ok" if ocr.confidence >= 0.4 else "low_confidence",
-                                    )
-                                else:
-                                    # Still store rendered page for visual retrieval
-                                    asset, occ, _ = register_image(
-                                        session,
-                                        image=rendered,
-                                        document_id=document.id,
-                                        page_number=page_no,
-                                        image_role="page_render",
-                                        indexable=True,
-                                        caption=f"Page {page_no} render",
-                                    )
-                                    page_image_occ_ids.setdefault(page_no, []).append(occ.id)
-                                    content_count += 1
+                                page_blank = skip_blank_renders and is_blank_image(
+                                    rendered,
+                                    max_std=float(self.cfg.get("low_info_max_std", 5.0)),
+                                )
+                                if page_blank and not page_has_objects:
                                     update_page(
                                         session,
                                         document.id,
                                         page_no,
                                         ocr_status="empty",
+                                        image_extraction_status="skipped_blank",
                                     )
+                                    logger.info(
+                                        "Skipping blank page render %s p%s (no objects)",
+                                        pdf_name,
+                                        page_no,
+                                    )
+                                else:
+                                    ocr = ocr_page_image(rendered)
+                                    ocr_text = ocr.text
+                                    if ocr_text:
+                                        ocr_chunks = pack_paragraphs(
+                                            [ocr_text],
+                                            page_number=page_no,
+                                            section_heading="OCR",
+                                            chunk_type="ocr",
+                                            max_chars=2000,
+                                        )
+                                        chunks_for_page.extend(ocr_chunks)
+                                        asset, occ, _ = register_image(
+                                            session,
+                                            image=rendered,
+                                            document_id=document.id,
+                                            page_number=page_no,
+                                            image_role="page_scan",
+                                            indexable=True,
+                                            caption=f"Page {page_no} scan",
+                                            ocr_text=ocr_text,
+                                        )
+                                        page_image_occ_ids.setdefault(page_no, []).append(occ.id)
+                                        content_count += 1
+                                        update_page(
+                                            session,
+                                            document.id,
+                                            page_no,
+                                            ocr_status="ok"
+                                            if ocr.confidence >= 0.4
+                                            else "low_confidence",
+                                        )
+                                    elif not page_blank:
+                                        asset, occ, _ = register_image(
+                                            session,
+                                            image=rendered,
+                                            document_id=document.id,
+                                            page_number=page_no,
+                                            image_role="page_render",
+                                            indexable=True,
+                                            caption=f"Page {page_no} render",
+                                        )
+                                        page_image_occ_ids.setdefault(page_no, []).append(occ.id)
+                                        content_count += 1
+                                        update_page(
+                                            session,
+                                            document.id,
+                                            page_no,
+                                            ocr_status="empty",
+                                        )
+                                    else:
+                                        update_page(
+                                            session,
+                                            document.id,
+                                            page_no,
+                                            ocr_status="empty",
+                                        )
                             except Exception as exc:  # noqa: BLE001
                                 errors.append(f"ocr:{exc}")
                                 update_page(
@@ -378,11 +476,30 @@ class PageAwareIngestor:
                                 ocr_status="n/a",
                             )
 
-                        # Embedded images → asset registry (store once, keep occurrences)
+                        # Embedded images — non-negotiable: never upload HF / chrome / blanks
+                        page_w = float(page.rect.width) or 1.0
+                        page_h = float(page.rect.height) or 1.0
                         for cand in candidates_by_page.get(page_no, []):
-                            is_hf = cand["phash"] in hf_hashes or cand["in_band"]
-                            role = "header_footer" if is_hf else "content"
-                            indexable = (not is_hf) or index_hf
+                            ph = cand["phash"]
+                            is_repeat = ph in hf_hashes
+                            is_dup = ph in dup_hashes
+                            reason = self._skip_reason(
+                                cand["img"],
+                                bbox=cand.get("bbox") or {},
+                                page_width=page_w,
+                                page_height=page_h,
+                                is_cross_page_repeat=is_repeat,
+                                is_duplicate_hash=is_dup,
+                            )
+                            if reason in {
+                                "blank",
+                                "brand",
+                                "header_footer",
+                            }:
+                                continue
+                            if ph in banned_hashes and not index_hf:
+                                continue
+                            role = "content"
                             try:
                                 asset, occ, created = register_image(
                                     session,
@@ -390,52 +507,49 @@ class PageAwareIngestor:
                                     document_id=document.id,
                                     page_number=page_no,
                                     image_role=role,
-                                    indexable=indexable,
+                                    indexable=True,
                                     caption="",
                                     bbox=cand.get("bbox") or {},
                                 )
                                 page_image_occ_ids.setdefault(page_no, []).append(occ.id)
                                 content_count += 1
-                                # Convenience symlink-style copy for UI under assets/images
-                                if indexable:
-                                    conv = images_dir() / f"{doc_name}_p{page_no}_fig{cand['img_idx']}.png"
-                                    if not conv.exists():
-                                        cand["img"].save(conv, format="PNG")
-                                    rel = f"assets/images/{conv.name}"
-                                    body = (
-                                        f"# Figure p{page_no} fig{cand['img_idx']} - {doc_name}\n\n"
-                                        f"![{conv.name}]({rel})\n\n"
-                                        f"Caption: [NEEDS_CAPTION]\n\n"
-                                        f"Asset: `{asset.id}` occurrence: `{occ.id}`\n"
-                                        f"Page mapping: source=`{pdf_name}` page=`{page_no}`\n"
-                                    )
-                                    meta = {
-                                        "type": "figure",
-                                        "title": f"Figure p{page_no} fig{cand['img_idx']} - {doc_name}",
-                                        "source": pdf_name,
-                                        "source_loc": f"page:{page_no}",
-                                        "tags": ["figure", doc_name, f"page-{page_no}", role],
-                                        "business_unit": "general",
-                                        "owner": "system",
-                                        "related": [],
-                                        "created": "",
-                                        "confidentiality": "internal",
-                                        "version": version,
-                                        "section": "",
-                                        "image_path": rel,
-                                        "excluded": not indexable,
-                                        "image_role": role,
-                                        "page": page_no,
-                                        "global_image_asset_id": asset.id,
-                                        "occurrence_id": occ.id,
-                                        "content_hash": asset.content_hash,
-                                    }
-                                    from datetime import date
+                                conv = images_dir() / f"{doc_name}_p{page_no}_fig{cand['img_idx']}.png"
+                                cand["img"].save(conv, format="PNG")
+                                rel = f"assets/images/{conv.name}"
+                                body = (
+                                    f"# Figure p{page_no} fig{cand['img_idx']} - {doc_name}\n\n"
+                                    f"![{conv.name}]({rel})\n\n"
+                                    f"Caption: [NEEDS_CAPTION]\n\n"
+                                    f"Asset: `{asset.id}` occurrence: `{occ.id}`\n"
+                                    f"Page mapping: source=`{pdf_name}` page=`{page_no}`\n"
+                                )
+                                meta = {
+                                    "type": "figure",
+                                    "title": f"Figure p{page_no} fig{cand['img_idx']} - {doc_name}",
+                                    "source": pdf_name,
+                                    "source_loc": f"page:{page_no}",
+                                    "tags": ["figure", doc_name, f"page-{page_no}", role],
+                                    "business_unit": "general",
+                                    "owner": "system",
+                                    "related": [],
+                                    "created": "",
+                                    "confidentiality": "internal",
+                                    "version": version,
+                                    "section": "",
+                                    "image_path": rel,
+                                    "excluded": False,
+                                    "image_role": role,
+                                    "page": page_no,
+                                    "global_image_asset_id": asset.id,
+                                    "occurrence_id": occ.id,
+                                    "content_hash": asset.content_hash,
+                                }
+                                from datetime import date
 
-                                    meta["created"] = str(date.today())
-                                    fig_path = out_dir / f"figure_p{page_no}_{cand['img_idx']}.md"
-                                    ensure_parent(fig_path)
-                                    fig_path.write_text(_render_okf(meta, body), encoding="utf-8")
+                                meta["created"] = str(date.today())
+                                fig_path = out_dir / f"figure_p{page_no}_{cand['img_idx']}.md"
+                                ensure_parent(fig_path)
+                                fig_path.write_text(_render_okf(meta, body), encoding="utf-8")
                             except Exception as exc:  # noqa: BLE001
                                 errors.append(f"image:{exc}")
 

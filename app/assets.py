@@ -16,6 +16,63 @@ from app.utils import assets_registry_dir, bytes_sha256, load_config
 logger = get_logger(__name__)
 
 
+def pixmap_to_pil(pix: Any) -> Image.Image:
+    """
+    Convert a PyMuPDF Pixmap to an RGB PIL image without color loss.
+
+    Textbook PDFs commonly embed:
+    - DeviceCMYK / Indexed→CMYK (JPX) — must not be read as RGBA
+    - DeviceN/Separation **Black** (single CMYK K channel) — samples are *ink
+      coverage* (high = dark), not luminance. Reading them as DeviceGray yields
+      photographic negatives (author portraits in English.pdf).
+
+    Always normalize non-RGB spaces through MuPDF's DeviceRGB transform, and
+    keep the pixmap's native width/height (document embedded resolution).
+    """
+    import fitz  # PyMuPDF
+
+    if pix is None:
+        raise ValueError("pixmap is None")
+
+    working = pix
+    cs = working.colorspace
+    cs_name = (cs.name if cs is not None else "") or ""
+    cs_n = int(cs.n) if cs is not None else int(working.n) - int(bool(working.alpha))
+    low = cs_name.lower()
+
+    already_rgb = (
+        cs is not None
+        and cs_n == 3
+        and int(working.n) == 3
+        and not working.alpha
+        and "rgb" in low
+        and "devicen" not in low
+        and "cmyk" not in low
+    )
+
+    if not already_rgb:
+        # CMYK, DeviceN/Separation (Black ink), Gray, Indexed, ICC, alpha → RGB
+        try:
+            working = fitz.Pixmap(fitz.csRGB, working)
+        except Exception:
+            # Rare: colorspace None / mask-only — fall back to raw samples
+            if int(working.n) - int(bool(working.alpha)) == 1:
+                if working.alpha:
+                    working = fitz.Pixmap(working, 0)
+                img = Image.frombytes(
+                    "L", (working.width, working.height), working.samples
+                )
+                return img.convert("RGB")
+            raise
+
+    if working.alpha:
+        working = fitz.Pixmap(working, 0)
+    if working.n != 3:
+        working = fitz.Pixmap(fitz.csRGB, working)
+
+    return Image.frombytes("RGB", (working.width, working.height), working.samples)
+
+
 def _dhash_hex(img: Image.Image) -> str:
     gray = img.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
     pixels = list(gray.getdata())

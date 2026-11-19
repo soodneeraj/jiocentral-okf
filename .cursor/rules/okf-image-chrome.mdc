@@ -1,0 +1,15 @@
+---
+description: Non-negotiable OKF image extraction — never store headers/footers/chrome
+globs: app/pipeline.py,app/ingest.py,app/image_chrome.py,app/assets.py,config.yaml
+alwaysApply: false
+---
+
+# OKF image chrome policy (non-negotiable)
+
+When extracting or re-extracting document images into the OKF bundle:
+
+- **Never** persist common headers, footers, watermarks, or repeated page ornaments.
+- **Never** persist decorative margin/sidebar texture strips or HF-band banners.
+- Cross-page repeated hashes and duplicate hashes within a PDF must be dropped.
+- `header_footer_filter_enabled` / `index_header_footer_images` cannot weaken this — enforcement lives in `app/image_chrome.py` and is forced on in ingest/pipeline.
+- Keep content figures (photos, diagrams, meaningful illustrations) at **native PDF resolution** under `okf-bundle/assets/images/`.

@@ -432,6 +432,8 @@ def rag_answer(
     conversation_id: str | None = None,
     user_id: str = "anonymous",
     access_scopes: list[str] | None = None,
+    mode: str | None = None,
+    skip_cache: bool = False,
 ) -> dict[str, Any]:
     """Full RAG pipeline via orchestrator (hybrid retrieve + grounded answer)."""
     from app.orchestrator import rag_answer as _orchestrated
@@ -443,4 +445,6 @@ def rag_answer(
         conversation_id=conversation_id,
         user_id=user_id,
         access_scopes=access_scopes,
+        mode=mode,
+        skip_cache=skip_cache,
     )

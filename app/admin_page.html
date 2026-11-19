@@ -59,7 +59,11 @@
       margin-top: 0.5rem;
     }
     button.secondary { background: #2a3648; }
+    button.danger { background: var(--err); }
+    button.danger:hover { filter: brightness(1.08); }
+    button.sm { padding: 0.35rem 0.7rem; font-size: 0.8rem; margin: 0; }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
+    td.actions { white-space: nowrap; width: 1%; }
     #msg { margin-top: 1rem; white-space: pre-wrap; }
     #status { font-family: ui-monospace, Consolas, monospace; font-size: 0.85rem; color: var(--muted); }
     table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; }
@@ -113,9 +117,12 @@
 
     <section class="card">
       <strong>PDFs in source_pdfs/</strong>
+      <p class="sub" style="margin:0.35rem 0 0;">
+        Delete removes the PDF and all references (OKF concepts/images, Milvus, metadata DB).
+      </p>
       <table>
-        <thead><tr><th>Name</th><th>Size (KB)</th><th>Modified</th></tr></thead>
-        <tbody id="pdfBody"><tr><td colspan="3">(loading…)</td></tr></tbody>
+        <thead><tr><th>Name</th><th>Size (KB)</th><th>Modified</th><th></th></tr></thead>
+        <tbody id="pdfBody"><tr><td colspan="4">(loading…)</td></tr></tbody>
       </table>
     </section>
   </main>
@@ -150,11 +157,55 @@
 
       const rows = pdfs.pdfs || [];
       if (!rows.length) {
-        pdfBody.innerHTML = '<tr><td colspan="3">(none)</td></tr>';
+        pdfBody.innerHTML = '<tr><td colspan="4">(none)</td></tr>';
       } else {
-        pdfBody.innerHTML = rows.map(r =>
-          `<tr><td>${r.name}</td><td>${r.size_kb}</td><td>${r.modified}</td></tr>`
-        ).join("");
+        pdfBody.innerHTML = rows.map(r => {
+          const safe = String(r.name)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/"/g, "&quot;");
+          const encoded = encodeURIComponent(r.name);
+          return `<tr>
+            <td>${safe}</td>
+            <td>${r.size_kb}</td>
+            <td>${r.modified}</td>
+            <td class="actions">
+              <button type="button" class="danger sm" data-delete="${encoded}">Delete</button>
+            </td>
+          </tr>`;
+        }).join("");
+        pdfBody.querySelectorAll("button[data-delete]").forEach((btn) => {
+          btn.addEventListener("click", () =>
+            deletePdf(decodeURIComponent(btn.getAttribute("data-delete") || ""))
+          );
+        });
+      }
+    }
+
+    async function deletePdf(name) {
+      if (!name) return;
+      const ok = window.confirm(
+        `Delete "${name}"?\n\nThis permanently removes the PDF and all indexed references (OKF, Milvus, metadata).`
+      );
+      if (!ok) return;
+      try {
+        const res = await fetch("/admin/pdfs/" + encodeURIComponent(name), { method: "DELETE" });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setMsg((data && (data.detail || data.message)) ? JSON.stringify(data) : "Delete failed", false);
+        } else {
+          setMsg(
+            "Deleted " + name +
+            "\nPDF: " + (data.pdf_removed ? "removed" : "missing") +
+            " | concepts: " + (data.concepts_removed ? "removed" : "n/a") +
+            " | images: " + ((data.images_removed || []).length) +
+            " | milvus text/image: " + ((data.milvus || {}).text || 0) + "/" + ((data.milvus || {}).image || 0) +
+            " | db docs: " + (((data.db || {}).documents) || 0)
+          );
+        }
+        await refresh();
+      } catch (err) {
+        setMsg(String(err), false);
       }
     }
 
